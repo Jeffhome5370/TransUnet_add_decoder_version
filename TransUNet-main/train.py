@@ -7,6 +7,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from networks.vit_seg_modeling import VisionTransformer as ViT_seg
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
+from networks.vit_seg_modeling import TransUNet_TransformerDecoder
 from trainer import trainer_synapse
 
 parser = argparse.ArgumentParser()
@@ -39,6 +40,10 @@ parser.add_argument('--vit_name', type=str,
                     default='R50-ViT-B_16', help='select one vit model')
 parser.add_argument('--vit_patches_size', type=int,
                     default=16, help='vit_patches_size, default is 16')
+parser.add_argument('--num_queries', type=int,
+                    default=20, help='number of queries for transformer decoder')
+parser.add_argument('--add_decoder', type=int,
+                    default=0, help='1 for add transformer decoder or just transformer encoder')
 args = parser.parse_args()
 
 
@@ -86,8 +91,36 @@ if __name__ == "__main__":
     config_vit.n_skip = args.n_skip
     if args.vit_name.find('R50') != -1:
         config_vit.patches.grid = (int(args.img_size / args.vit_patches_size), int(args.img_size / args.vit_patches_size))
-    net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
-    net.load_from(weights=np.load(config_vit.pretrained_path))
+    # net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    # net.load_from(weights=np.load(config_vit.pretrained_path))
+
+    #trainer = {'Synapse': trainer_synapse,}
+    #trainer[dataset_name](args, net, snapshot_path)
+    # A. 實例化原始 TransUNet (目的是為了載入 R50+ViT 的權重)
+    original_net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    
+    # B. 載入 ImageNet21k 預訓練權重
+    original_net.load_from(weights=np.load(config_vit.pretrained_path))
+    print("Pretrained R50+ViT weights loaded.")
+
+    if (args.add_decoder):
+        # C. 將原始模型包裝進 Decoder-only 架構
+        # 這會自動凍結 original_net 的參數，並初始化新的 Decoder
+        net = TransUNet_TransformerDecoder(
+            original_model=original_net,
+            num_classes=args.num_classes,
+            num_queries=args.num_queries, # 使用 argument 傳入的值
+            num_decoder_layers=3
+        ).cuda()
+    
+        # Log 資訊確認
+        trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in net.parameters())
+        print(f"Model constructed. Encoder frozen.")
+        print(f"Total Params: {total_params/1e6:.2f}M, Trainable Params: {trainable_params/1e6:.2f}M")
+    else:
+        net = original_net
+    # -----------------------------------------------------------------
 
     trainer = {'Synapse': trainer_synapse,}
     trainer[dataset_name](args, net, snapshot_path)

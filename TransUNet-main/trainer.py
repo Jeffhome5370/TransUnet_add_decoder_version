@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils import DiceLoss
 from torchvision import transforms
+import torch.nn.functional as F  # <--- 新增: 用於 Upsample
 
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
@@ -40,7 +41,17 @@ def trainer_synapse(args, model, snapshot_path):
     model.train()
     ce_loss = CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes)
-    optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+
+    # optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+    # ------------------------------------------------------------------
+    # 修改 1: 優化器只追蹤需要訓練的參數 (Decoder)
+    # ------------------------------------------------------------------
+    # 原本: optimizer = optim.SGD(model.parameters(), ...)
+    # 修改後: 過濾 requires_grad=True 的參數
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = optim.SGD(trainable_params, lr=base_lr, momentum=0.9, weight_decay=0.0001)
+    # ------------------------------------------------------------------
+
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
     max_epoch = args.max_epochs
@@ -52,7 +63,22 @@ def trainer_synapse(args, model, snapshot_path):
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
-            outputs = model(image_batch)
+            model_outputs = model(image_batch)
+            # 新模型的輸出是 (class_logits, refined_masks_list)
+            # 我們取出最後一層的 Mask 預測
+            # 形狀通常是 (B, num_queries, 14, 14)
+            _, refined_masks = model_outputs
+            outputs = refined_masks[-1] 
+            
+            # 執行上採樣 (Upsampling) 到圖片原始大小 (例如 224x224)
+            # 因為 Transformer Decoder 在 Patch Level 運作
+            outputs = F.interpolate(outputs, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
+            
+            # 重要假設：
+            # 這裡假設 num_queries == num_classes。
+            # 如果你的 Query 數量 (20) 與 類別數量 (9) 不同，標準 Dice/CE Loss 會報錯。
+            # 在這種簡單實作下，請在 train.py 確保 --num_queries 等於 --num_classes
+            # ------------------------------------------------------------------
             loss_ce = ce_loss(outputs, label_batch[:].long())
             loss_dice = dice_loss(outputs, label_batch, softmax=True)
             loss = 0.5 * loss_ce + 0.5 * loss_dice
