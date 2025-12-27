@@ -57,7 +57,7 @@ class Synapse_dataset(Dataset):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        if self.split == "train":
+        if "train" in self.split or "val" in self.split:
             slice_name = self.sample_list[idx].strip('\n')
             data_path = os.path.join(self.data_dir, slice_name+'.npz')
             data = np.load(data_path)
@@ -71,5 +71,16 @@ class Synapse_dataset(Dataset):
         sample = {'image': image, 'label': label}
         if self.transform:
             sample = self.transform(sample)
+        else:
+            image = sample['image']
+            label = sample['label']
+            
+            # 1. 轉成 Tensor 並增加 Channel 維度: (H, W) -> (1, H, W)
+            image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+            
+            # 2. Label 轉成 LongTensor (不需增加維度)
+            label = torch.from_numpy(label.astype(np.float32)).long()
+            
+            sample = {'image': image, 'label': label}
         sample['case_name'] = self.sample_list[idx].strip('\n')
         return sample

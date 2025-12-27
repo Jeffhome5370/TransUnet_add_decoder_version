@@ -1,0 +1,30 @@
+# --- WandB ---
+wandb/
+*.wandb
+
+# --- Python 編譯檔 (不需要上傳) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 模型權重檔 (檔案太大，GitHub 限制 100MB) ---
+# 除非您有用 git-lfs，否則不要上傳 .pth
+*.pth
+*.tar
+*.gz
+
+# --- 資料集 (每個人存放位置不同，不要上傳) ---
+data/
+../data/
+lists/
+
+# --- 訓練輸出的 Log 和預測結果 ---
+test_log/
+predictions/
+model/
+snapshot/
+log/
+
+# --- IDE 設定檔 (VSCode/PyCharm) ---
+.vscode/
+.idea/

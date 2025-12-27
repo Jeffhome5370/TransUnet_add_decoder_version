@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import wandb
 from networks.vit_seg_modeling import VisionTransformer as ViT_seg
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from networks.vit_seg_modeling import TransUNet_TransformerDecoder
@@ -44,6 +45,7 @@ parser.add_argument('--num_queries', type=int,
                     default=20, help='number of queries for transformer decoder')
 parser.add_argument('--add_decoder', type=int,
                     default=0, help='1 for add transformer decoder or just transformer encoder')
+parser.add_argument('--exp_name', type=str, default=None, help='Name of the experiment run')
 args = parser.parse_args()
 
 
@@ -93,9 +95,23 @@ if __name__ == "__main__":
         config_vit.patches.grid = (int(args.img_size / args.vit_patches_size), int(args.img_size / args.vit_patches_size))
     # net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
     # net.load_from(weights=np.load(config_vit.pretrained_path))
-
+    
     #trainer = {'Synapse': trainer_synapse,}
     #trainer[dataset_name](args, net, snapshot_path)
+
+    # -------------------------------------------------------
+    # [新增 2] 初始化 WandB
+    # -------------------------------------------------------
+    # 如果沒有指定 exp_name，就用預設的 exp 字串
+    run_name = args.exp_name if args.exp_name else args.exp
+    
+    wandb.init(
+        project="TransUNet_Experiments",  # 專案名稱 (自己取)
+        name=run_name,                    # 這次實驗的名稱
+        config=args,                      # 自動把所有 args 存成超參數表
+        reinit=True
+    )
+    # -------------------------------------------------------
     # A. 實例化原始 TransUNet (目的是為了載入 R50+ViT 的權重)
     original_net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
     
