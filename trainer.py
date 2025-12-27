@@ -198,15 +198,27 @@ def trainer_synapse(args, model, snapshot_path):
                     # --- Validation Forward ---
                     if args.add_decoder:
                         _, val_masks = model(val_img)
-                        val_out = val_masks[-1]
-                        val_out = F.interpolate(val_out, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
+                        val_out = val_masks
+                        #val_out = F.interpolate(val_out, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
                     else:
                         val_out = model(val_img)
-                    
+
+                    if val_out.dim() == 3:
+                        val_out = val_out.unsqueeze(0) # (9, 512, 512) -> (1, 9, 512, 512)
+
+                    # 雙重保險：如果 val_label 少了 Batch 維度，也補回去
+                    if val_label.dim() == 3:
+                        val_label = val_label.unsqueeze(0)
+
+                    if val_label.dim() == 5:
+                        val_label = val_label.squeeze(2)
                     # --- 計算 Dice Score ---
                     # 這裡為了效率，直接利用 DiceLoss 計算 (Dice = 1 - DiceLoss)
                     # 這樣可以快速得到 Batch 平均 Dice，不用做複雜的 Metric 計算
-                    v_loss_dice = dice_loss(val_out, val_label, softmax=True)
+                    #print(f"DEBUG: Out={val_out.shape}, Label={val_label.shape}")
+                    v_loss_dice = dice_loss(val_out, val_label, softmax=False)
+                    # [Debug] 印出形狀確認 (如果還是報錯，請看這裡印出的數字)
+                    #print(f"DEBUG: Out={val_out.shape}, Label={val_label.shape}")
                     val_dice = 1.0 - v_loss_dice.item()
                     
                     val_dice_sum += val_dice

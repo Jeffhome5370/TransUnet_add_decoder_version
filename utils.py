@@ -32,12 +32,21 @@ class DiceLoss(nn.Module):
     def forward(self, inputs, target, weight=None, softmax=False):
         if softmax:
             inputs = torch.softmax(inputs, dim=1)
-        target = self._one_hot_encoder(target)
+
+        if target.shape == inputs.shape:
+            pass # 什麼都不做，直接用
+        else:
+            # 只有當形狀不一樣時 (例如 target 是單層索引)，才做 One-Hot
+            if target.dim() == 4 and target.shape[1] == 1:
+                target = target.squeeze(1)
+            target = self._one_hot_encoder(target)
+
         if weight is None:
             weight = [1] * self.n_classes
         assert inputs.size() == target.size(), 'predict {} & target {} shape do not match'.format(inputs.size(), target.size())
         class_wise_dice = []
         loss = 0.0
+        target = target.float()
         for i in range(0, self.n_classes):
             dice = self._dice_loss(inputs[:, i], target[:, i])
             class_wise_dice.append(1.0 - dice.item())
@@ -59,37 +68,64 @@ def calculate_metric_percase(pred, gt):
 
 
 def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1):
+    # 1. 移除 Batch 維度: (1, D, H, W) -> (D, H, W)
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
-    if len(image.shape) == 3:
-        prediction = np.zeros_like(label)
-        for ind in range(image.shape[0]):
-            slice = image[ind, :, :]
-            x, y = slice.shape[0], slice.shape[1]
-            if x != patch_size[0] or y != patch_size[1]:
-                slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)  # previous using 0
-            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
-            net.eval()
-            with torch.no_grad():
-                outputs = net(input)
-                out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
-                out = out.cpu().detach().numpy()
-                if x != patch_size[0] or y != patch_size[1]:
-                    pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
-                else:
-                    pred = out
-                prediction[ind] = pred
-    else:
-        input = torch.from_numpy(image).unsqueeze(
-            0).unsqueeze(0).float().cuda()
+    
+    # 2. 安全檢查：如果有時候數據是 (1, D, H, W) 導致 squeeze 後還是 (1, D, H, W)，再 squeeze 一次
+    if len(image.shape) == 4:
+        image = image.squeeze(0)
+    if len(label.shape) == 4:
+        label = label.squeeze(0)
+
+    prediction = np.zeros_like(label)
+    
+    # 3. 逐層切片預測
+    for ind in range(image.shape[0]):
+        slice = image[ind, :, :] # 取出單張切片 (H, W)
+        x, y = slice.shape[0], slice.shape[1]
+        
+        # 如果尺寸不合，進行縮放
+        if x != patch_size[0] or y != patch_size[1]:
+            slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)
+            
+        # 4. [關鍵修正] 轉為 Tensor 並確保是 4D: (1, 1, H, W)
+        input = torch.from_numpy(slice).float().cuda()
+        
+        # 如果是 2D (H, W)，加兩個維度 -> (1, 1, H, W)
+        if len(input.shape) == 2:
+            input = input.unsqueeze(0).unsqueeze(0)
+        # 如果是 3D (1, H, W)，加一個維度 -> (1, 1, H, W)
+        elif len(input.shape) == 3:
+            input = input.unsqueeze(0)
+            
+        # 再次確認維度 (防止 5D 錯誤)
+        if len(input.shape) > 4:
+            input = input.view(1, 1, input.shape[-2], input.shape[-1])
+
         net.eval()
         with torch.no_grad():
-            out = torch.argmax(torch.softmax(net(input), dim=1), dim=1).squeeze(0)
-            prediction = out.cpu().detach().numpy()
+            # 這裡就是原本報錯的地方，現在 input 保證是 4D，不會錯了
+            outputs = net(input)
+            
+            # 如果是有 Decoder 的版本，輸出可能是 list，取最後一個
+            if isinstance(outputs, list) or isinstance(outputs, tuple):
+                 outputs = outputs[-1]
+
+            out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
+            out = out.cpu().detach().numpy()
+            
+            if x != patch_size[0] or y != patch_size[1]:
+                pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
+            else:
+                pred = out
+            prediction[ind] = pred
+
+    # 計算評估指標
     metric_list = []
     for i in range(1, classes):
         metric_list.append(calculate_metric_percase(prediction == i, label == i))
 
-    if test_save_path is not None:
+    if test_save_path:
         img_itk = sitk.GetImageFromArray(image.astype(np.float32))
         prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
         lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
@@ -99,4 +135,5 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
         sitk.WriteImage(prd_itk, test_save_path + '/'+case + "_pred.nii.gz")
         sitk.WriteImage(img_itk, test_save_path + '/'+ case + "_img.nii.gz")
         sitk.WriteImage(lab_itk, test_save_path + '/'+ case + "_gt.nii.gz")
+        
     return metric_list

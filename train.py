@@ -46,6 +46,11 @@ parser.add_argument('--num_queries', type=int,
 parser.add_argument('--add_decoder', type=int,
                     default=0, help='1 for add transformer decoder or just transformer encoder')
 parser.add_argument('--exp_name', type=str, default=None, help='Name of the experiment run')
+
+parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Transformer decoder')
+
+parser.add_argument('--decoder_stride', type=int, default=8,
+                    help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
 args = parser.parse_args()
 
 
@@ -126,7 +131,9 @@ if __name__ == "__main__":
             original_model=original_net,
             num_classes=args.num_classes,
             num_queries=args.num_queries, # 使用 argument 傳入的值
-            num_decoder_layers=3
+            num_decoder_layers=args.decoder_layer,
+            img_size=args.img_size,
+            decoder_stride=args.decoder_stride
         ).cuda()
     
         # Log 資訊確認

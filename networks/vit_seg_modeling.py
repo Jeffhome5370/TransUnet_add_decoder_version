@@ -515,22 +515,35 @@ class TransformerDecoderLayer(nn.Module):
         return query
 
 class TransUNet_TransformerDecoder(nn.Module):
-    def __init__(self, original_model, num_classes, num_queries=20, num_decoder_layers=3):
+    def __init__(self, original_model, num_classes, num_queries=20, num_decoder_layers=3, img_size=512, decoder_stride=8):
         super().__init__()
+        self.original_model = original_model
+        self.config = original_model.config
+        self.num_classes = num_classes
+        self.num_queries = num_queries
+        self.img_size = img_size
         # 1. 繼承原有的 Encoder (ResNet + ViT)
         self.transformer = original_model.transformer
-        self.config = original_model.config # 保留 config 供後續存取
+        self.decoder_cup = original_model.decoder 
+        #self.segmentation_head = original_model.segmentation_head # 這是原本的最後一層，我們可能用不到，但先留著
         
         # 鎖定 Encoder 參數 (Freeze)
         for param in self.transformer.parameters():
             param.requires_grad = False
+        for param in self.decoder_cup.parameters():
+            param.requires_grad = False
             
-        # 取得 Hidden Size (通常 ViT-Base 是 768)
-        self.hidden_size = original_model.config.hidden_size
+        # 這裡假設它是 16 (TransUNet 預設)，如果報錯請檢查 decoder_cup 的輸出
+        if 'decoder_channels' in self.config:
+            self.decoder_out_channels = self.config['decoder_channels'][-1]
+        else:
+            self.decoder_out_channels = 16 # Fallback
+        self.hidden_size = original_model.config.hidden_size# 768
         
-        # 2. 新增 Transformer Decoder (替換掉原本的 CNN Decoder)
-        # 論文 Part IV: Mask Classification
-        self.num_queries = num_queries
+        # 4. 特徵投影層 (重要！)
+        # 因為 DecoderCup 輸出 (B, 16, H, W) 但 Transformer 需要 (B, 768, H, W)
+        self.feature_projector = nn.Conv2d(self.decoder_out_channels, self.hidden_size, kernel_size=decoder_stride, stride=decoder_stride, padding=0)
+        self.feature_norm = nn.GroupNorm(32, self.hidden_size)
         self.query_embed = nn.Embedding(num_queries, self.hidden_size)
         
         self.decoder_layers = nn.ModuleList([
@@ -542,43 +555,84 @@ class TransUNet_TransformerDecoder(nn.Module):
         self.mask_projector = nn.Linear(self.hidden_size, self.hidden_size) # 用於計算 Mask
 
     def forward(self, x):
-        # A. 使用凍結的 Encoder 提取特徵
+        # 1. 處理輸入 (若是灰階圖轉為 RGB)
         if x.size(1) == 1:
             x = x.repeat(1,3,1,1)
+
+        # 2. Encoder (Transformer + ResNet Hybrid)
+        # 根據您的 VisionTransformer 實作: return x, attn_weights, features
+        x_vit, attn_weights, features = self.transformer(x)
             
-        # 這裡根據原本 vit_seg_modeling 的介面調用
-        # 請確認你的版本是返回 x, hidden_states 還是 embedding_output, features
-        x, hidden_states = self.transformer.embeddings(x) 
-        encoded_feats, _ = self.transformer.encoder(x)  # (B, L, C)
-        
-        # B. Transformer Decoder 流程
-        B = encoded_feats.shape[0]
-        
-        # 初始化 Queries (B, Q, C)
-        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1) 
-        
-        # 初始 Mask (Z^0) - (B, Q, L)
-        logits = torch.bmm(queries, encoded_feats.transpose(1, 2))
-        current_mask = torch.sigmoid(logits)
-        
+        # 3. DecoderCup (CNN Decoder)
+        # 這一步會將特徵上採樣並融合 Skip Connections，得到高解析度特徵 F
+        # 輸出形狀通常是 (B, 16, H, W)
+        feature_map_F = self.decoder_cup(x_vit, features)
+
+
+        # ============================================================
+        # Step 2: 進入 Mask Transformer Decoder (Part IV)
+        # ============================================================
+        # 1. 特徵投影與展平
+        # (B, 16, H, W) -> (B, 768, H, W)
+        projected_feats = self.feature_projector(feature_map_F)
+        projected_feats = self.feature_norm(projected_feats)
+        B, C, H, W = projected_feats.shape
+        # (B, 768, H, W) -> (B, H*W, 768) -> (B, L, C)
+        F_sequence = projected_feats.flatten(2).transpose(1, 2)
+
+        # 2. 初始化 Queries (B, Q, C)
+        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
+
+        # 3. 初始 Mask (Z^0) - 使用投影後的高解析特徵 F 計算
+        logits = torch.bmm(queries, F_sequence.transpose(1, 2))
+        current_mask = torch.sigmoid(logits) # (B, Q, L)
+
         refined_masks = []
-        
-        # Iterative Refinement
+
+        # 4. Iterative Refinement (層層修正)
         for layer in self.decoder_layers:
-            queries = layer(queries, encoded_feats, current_mask)
+            # 輸入：Queries, Key/Value (F_sequence), Mask (current_mask)
+            queries = layer(queries, F_sequence, current_mask)
             
             # 更新 Mask
             mask_embed = self.mask_projector(queries)
-            logits = torch.bmm(mask_embed, encoded_feats.transpose(1, 2))
+            logits = torch.bmm(mask_embed, F_sequence.transpose(1, 2))
             current_mask = torch.sigmoid(logits)
             
-            # Reshape 回空間維度 (B, Q, H, W) 供 Loss 計算
-            spatial_dim = int(encoded_feats.shape[1]**0.5) 
-            refined_masks.append(logits.view(B, self.num_queries, spatial_dim, spatial_dim))
+            # Reshape 回空間維度 (B, Q, H, W)
+            # 注意：這裡的 H, W 是 DecoderCup 的輸出大小 (例如 224 或 512)
+            refined_masks.append(logits.view(B, self.num_queries, H, W))
             
-        # 分類頭
+        # 5. 分類頭 (B, Q, Num_Classes)
         class_logits = self.class_head(queries)
-        
+
+        # ============================================================
+        # Step 3: 推論輸出處理 (測試時自動轉為 Segmentation Map)
+        # ============================================================
+        if not self.training:
+            # 1. 取出最後一層預測
+            final_mask_logits = refined_masks[-1]
+            
+            # 2. 轉為機率
+            mask_probs = torch.sigmoid(final_mask_logits)       # (B, Q, H, W)
+            class_probs = torch.softmax(class_logits, dim=-1)   # (B, Q, Num_Classes)
+            
+            # 3. 矩陣運算組合: 每個 Pixel 的類別 = 所有 Query 的加權總和
+            # einsum: "bqc, bqhw -> bchw"
+            semantic_segmentation = torch.einsum("bqc, bqhw -> bchw", class_probs, mask_probs)
+
+            semantic_segmentation = torch.clamp(semantic_segmentation, min=1e-7, max=1-1e-7)
+            # 使用雙線性插值 (Bilinear) 恢復成 input_size (512x512)
+            semantic_segmentation = F.interpolate(
+                semantic_segmentation, 
+                size= (self.img_size, self.img_size), 
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+            return None, semantic_segmentation
+
+        # 訓練模式回傳 Tuple 供 Loss 計算
         return class_logits, refined_masks
 
 CONFIGS = {

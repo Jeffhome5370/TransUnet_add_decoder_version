@@ -44,6 +44,9 @@ parser.add_argument('--vit_patches_size', type=int, default=16, help='vit_patche
 
 parser.add_argument('--add_decoder', type=int, default=0, help='1 for add transformer decoder')
 parser.add_argument('--num_queries', type=int, default=20, help='number of queries for transformer decoder')
+parser.add_argument('--exp_name', type=str, default='BTCV', help='experiment name') # 讓路徑匹配更容易
+parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Transformer decoder')
+parser.add_argument('--decoder_stride', type=int, default=8, help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
 args = parser.parse_args()
 
 
@@ -54,15 +57,23 @@ def inference(args, model, test_save_path=None):
     model.eval()
     metric_list = 0.0
     for i_batch, sampled_batch in tqdm(enumerate(testloader)):
-        h, w = sampled_batch["image"].size()[2:]
+        #h, w = sampled_batch["image"].size()[2:]
         image, label, case_name = sampled_batch["image"], sampled_batch["label"], sampled_batch['case_name'][0]
+
         metric_i = test_single_volume(image, label, model, classes=args.num_classes, patch_size=[args.img_size, args.img_size],
                                       test_save_path=test_save_path, case=case_name, z_spacing=args.z_spacing)
         metric_list += np.array(metric_i)
         logging.info('idx %d case %s mean_dice %f mean_hd95 %f' % (i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
     metric_list = metric_list / len(db_test)
+
+    class_labels = {
+        1: "Aorta", 2: "Gallbladder", 3: "Kidney(L)", 4: "Kidney(R)",
+        5: "Liver", 6: "Pancreas", 7: "Spleen", 8: "Stomach"
+    }
     for i in range(1, args.num_classes):
-        logging.info('Mean class %d mean_dice %f mean_hd95 %f' % (i, metric_list[i-1][0], metric_list[i-1][1]))
+        class_name = class_labels.get(i, f"Class {i}")
+        logging.info('Mean class %d name %s mean_dice %f mean_hd95 %f' % (
+            i, class_name, metric_list[i-1][0], metric_list[i-1][1]))
     performance = np.mean(metric_list, axis=0)[0]
     mean_hd95 = np.mean(metric_list, axis=0)[1]
     logging.info('Testing performance in best val model: mean_dice : %f mean_hd95 : %f' % (performance, mean_hd95))
@@ -120,11 +131,41 @@ if __name__ == "__main__":
     config_vit.patches.size = (args.vit_patches_size, args.vit_patches_size)
     if args.vit_name.find('R50') !=-1:
         config_vit.patches.grid = (int(args.img_size/args.vit_patches_size), int(args.img_size/args.vit_patches_size))
-    net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    
+    base_model = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    if args.add_decoder:
+        print("Add Transformer Decoder...")
+        net = TransUNet_TransformerDecoder(
+            original_model=base_model,   # <--- 關鍵修改：傳入實例化好的模型
+            num_classes=args.num_classes,
+            num_queries=args.num_queries,
+            img_size= args.img_size,
+            decoder_stride=args.decoder_stride,
+            num_decoder_layers=args.decoder_layer # 如果您訓練時有改層數，這裡也要加，預設是3
+        ).cuda()
+    else:
+        print("Loading Original TransUNet(only transformer Encoder)...")
+        net = base_model
 
     snapshot = os.path.join(snapshot_path, 'best_model.pth')
     if not os.path.exists(snapshot): snapshot = snapshot.replace('best_model', 'epoch_'+str(args.max_epochs-1))
-    net.load_state_dict(torch.load(snapshot))
+    
+    if os.path.exists(snapshot):
+        print(f"Loading model from: {snapshot}")
+        # 處理 DataParallel 帶來的 'module.' 前綴問題
+        state_dict = torch.load(snapshot)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.'):
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        net.load_state_dict(new_state_dict, strict=True)
+    else:
+        print(f"Error: Model not found at {snapshot}")
+        sys.exit(1)
+
+
     snapshot_name = snapshot_path.split('/')[-1]
 
     log_folder = './test_log/test_log_' + args.exp
