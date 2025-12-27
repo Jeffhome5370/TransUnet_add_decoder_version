@@ -51,6 +51,8 @@ parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Tra
 
 parser.add_argument('--decoder_stride', type=int, default=8,
                     help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
+
+parser.add_argument('--patience', type=int, default=30, help='early_stop')
 args = parser.parse_args()
 
 
@@ -135,7 +137,7 @@ if __name__ == "__main__":
             img_size=args.img_size,
             decoder_stride=args.decoder_stride
         ).cuda()
-    
+
         # Log 資訊確認
         trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in net.parameters())

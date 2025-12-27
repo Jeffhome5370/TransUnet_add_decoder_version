@@ -585,6 +585,7 @@ class TransUNet_TransformerDecoder(nn.Module):
 
         # 3. 初始 Mask (Z^0) - 使用投影後的高解析特徵 F 計算
         logits = torch.bmm(queries, F_sequence.transpose(1, 2))
+        logits = torch.clamp(logits, -10, 10) 
         current_mask = torch.sigmoid(logits) # (B, Q, L)
 
         refined_masks = []
@@ -597,6 +598,7 @@ class TransUNet_TransformerDecoder(nn.Module):
             # 更新 Mask
             mask_embed = self.mask_projector(queries)
             logits = torch.bmm(mask_embed, F_sequence.transpose(1, 2))
+            logits = torch.clamp(logits, -10, 10)
             current_mask = torch.sigmoid(logits)
             
             # Reshape 回空間維度 (B, Q, H, W)
@@ -620,6 +622,20 @@ class TransUNet_TransformerDecoder(nn.Module):
             # 3. 矩陣運算組合: 每個 Pixel 的類別 = 所有 Query 的加權總和
             # einsum: "bqc, bqhw -> bchw"
             semantic_segmentation = torch.einsum("bqc, bqhw -> bchw", class_probs, mask_probs)
+            '''
+            print("FORWARD DEBUG semantic pre-clamp min/max/mean:",
+                float(semantic_segmentation.min().item()),
+                float(semantic_segmentation.max().item()),
+                float(semantic_segmentation.mean().item()))
+            print("FORWARD DEBUG mask_probs min/max/mean:",
+                float(mask_probs.min().item()),
+                float(mask_probs.max().item()),
+                float(mask_probs.mean().item()))
+            print("FORWARD DEBUG class_probs min/max/mean:",
+                float(class_probs.min().item()),
+                float(class_probs.max().item()),
+                float(class_probs.mean().item()))
+            '''
 
             semantic_segmentation = torch.clamp(semantic_segmentation, min=1e-7, max=1-1e-7)
             # 使用雙線性插值 (Bilinear) 恢復成 input_size (512x512)

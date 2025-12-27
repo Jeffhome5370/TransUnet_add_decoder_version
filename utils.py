@@ -80,44 +80,62 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
     prediction = np.zeros_like(label)
     
     # 3. 逐層切片預測
-    for ind in range(image.shape[0]):
-        slice = image[ind, :, :] # 取出單張切片 (H, W)
-        x, y = slice.shape[0], slice.shape[1]
-        
-        # 如果尺寸不合，進行縮放
-        if x != patch_size[0] or y != patch_size[1]:
-            slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)
+    net.eval()
+    with torch.no_grad():
+        for ind in range(image.shape[0]):
+            slice = image[ind, :, :] # 取出單張切片 (H, W)
+            x, y = slice.shape[0], slice.shape[1]
             
-        # 4. [關鍵修正] 轉為 Tensor 並確保是 4D: (1, 1, H, W)
-        input = torch.from_numpy(slice).float().cuda()
-        
-        # 如果是 2D (H, W)，加兩個維度 -> (1, 1, H, W)
-        if len(input.shape) == 2:
-            input = input.unsqueeze(0).unsqueeze(0)
-        # 如果是 3D (1, H, W)，加一個維度 -> (1, 1, H, W)
-        elif len(input.shape) == 3:
-            input = input.unsqueeze(0)
+            # 如果尺寸不合，進行縮放
+            if x != patch_size[0] or y != patch_size[1]:
+                slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)
+                
+            # 4. [關鍵修正] 轉為 Tensor 並確保是 4D: (1, 1, H, W)
+            input = torch.from_numpy(slice).float().cuda()
             
-        # 再次確認維度 (防止 5D 錯誤)
-        if len(input.shape) > 4:
-            input = input.view(1, 1, input.shape[-2], input.shape[-1])
+            # 如果是 2D (H, W)，加兩個維度 -> (1, 1, H, W)
+            if len(input.shape) == 2:
+                input = input.unsqueeze(0).unsqueeze(0)
+            # 如果是 3D (1, H, W)，加一個維度 -> (1, 1, H, W)
+            elif len(input.shape) == 3:
+                input = input.unsqueeze(0)
+                
+            # 再次確認維度 (防止 5D 錯誤)
+            if len(input.shape) > 4:
+                input = input.view(1, 1, input.shape[-2], input.shape[-1])
 
-        net.eval()
-        with torch.no_grad():
-            # 這裡就是原本報錯的地方，現在 input 保證是 4D，不會錯了
-            outputs = net(input)
             
-            # 如果是有 Decoder 的版本，輸出可能是 list，取最後一個
-            if isinstance(outputs, list) or isinstance(outputs, tuple):
-                 outputs = outputs[-1]
+            raw_outputs = net(input)
 
-            out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
-            out = out.cpu().detach().numpy()
-            
+            # 你的模型推論回傳 (None, semantic_segmentation)
+            if isinstance(raw_outputs, (list, tuple)):
+                outputs = raw_outputs[-1]   # 取 semantic_segmentation: (B, C, H, W)
+            else:
+                outputs = raw_outputs
+
+            # 安全檢查：確保是 (B,C,H,W)
+            if (not torch.is_tensor(outputs)) or outputs.dim() != 4:
+                raise RuntimeError(f"Expected outputs to be 4D tensor (B,C,H,W), but got {type(outputs)}")
+
+            if ind == 0:
+                print("DEBUG outputs shape:", tuple(outputs.shape))
+                print("DEBUG outputs min/max:", float(outputs.min().item()), float(outputs.max().item()))
+                print("DEBUG outputs abs-mean:", float(outputs.abs().mean().item()))
+                bg = outputs[:, 0].mean().item()
+                mx = outputs.max(dim=1).values.mean().item()
+                print("DEBUG bg_score_mean:", bg, "DEBUG max_score_mean:", mx)
+
+            out = torch.argmax(outputs, dim=1).squeeze(0).cpu().numpy()
+
+            if ind == 0:
+                print("DEBUG pred unique:", np.unique(out)[:20], "fg:", float((out > 0).mean()))
+
+            # resize 回原圖大小（如果有縮放）
             if x != patch_size[0] or y != patch_size[1]:
                 pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
             else:
                 pred = out
+
             prediction[ind] = pred
 
     # 計算評估指標

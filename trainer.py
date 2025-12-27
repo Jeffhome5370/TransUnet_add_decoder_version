@@ -25,6 +25,8 @@ def worker_init_fn(worker_id):
     # 使用全域變數加上 worker_id
     random.seed(GLOBAL_WORKER_SEED + worker_id)
 
+
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
     # --- 修改 3: 在這裡更新全域種子，確保吃到 args.seed ---
@@ -76,7 +78,12 @@ def trainer_synapse(args, model, snapshot_path):
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     model.train()
-    ce_loss = CrossEntropyLoss()
+    weights = torch.tensor(
+        [1.0] + [3.0] * (num_classes - 1),
+        device='cuda'
+    )
+    ce_loss = CrossEntropyLoss(weight=weights)
+    #ce_loss = CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes)
 
     # optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
@@ -86,7 +93,7 @@ def trainer_synapse(args, model, snapshot_path):
     # 原本: optimizer = optim.SGD(model.parameters(), ...)
     # 修改後: 過濾 requires_grad=True 的參數
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.SGD(trainable_params, lr=base_lr, momentum=0.9, weight_decay=0.0001)
+    optimizer = optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.0001)
     # ------------------------------------------------------------------
 
     writer = SummaryWriter(snapshot_path + '/log')
@@ -121,6 +128,11 @@ def trainer_synapse(args, model, snapshot_path):
             loss = 0.5 * loss_ce + 0.5 * loss_dice
             optimizer.zero_grad()
             loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                trainable_params,   # 或 model.parameters()
+                max_norm=1.0
+            )
             optimizer.step()
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -232,14 +244,14 @@ def trainer_synapse(args, model, snapshot_path):
             })
             writer.add_scalar('info/val_dice', avg_val_dice, epoch_num)
             logging.info('Epoch %d : Validation Mean Dice: %f' % (epoch_num, avg_val_dice))
-
+            
             # ================================
             #       Save Best Model
             # ================================
             if avg_val_dice > best_performance:
                 best_performance = avg_val_dice
                 save_best_path = os.path.join(snapshot_path, 'best_model.pth')
-                
+                count = 0
                 if args.n_gpu > 1:
                     torch.save(model.module.state_dict(), save_best_path)
                 else:
@@ -247,6 +259,11 @@ def trainer_synapse(args, model, snapshot_path):
                 
                 logging.info("######## Saved new best model (Dice: {:.4f}) to {} ########".format(best_performance, save_best_path))
                 wandb.run.summary["best_val_dice"] = best_performance
+            else:
+                count += 1
+            if (count*5 == args.patience):
+                logging.info(f"Early stopping triggered at epoch {epoch_num}")
+                break
 
         save_interval = 50  # int(max_epoch/6)
         if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
@@ -260,6 +277,6 @@ def trainer_synapse(args, model, snapshot_path):
             logging.info("save model to {}".format(save_mode_path))
             iterator.close()
             break
-
+    
     writer.close()
     return "Training Finished!"

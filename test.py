@@ -149,23 +149,20 @@ if __name__ == "__main__":
 
     snapshot = os.path.join(snapshot_path, 'best_model.pth')
     if not os.path.exists(snapshot): snapshot = snapshot.replace('best_model', 'epoch_'+str(args.max_epochs-1))
+    #-----------------------------------------------------
+    ckpt = torch.load(snapshot, map_location="cpu")
     
-    if os.path.exists(snapshot):
-        print(f"Loading model from: {snapshot}")
-        # 處理 DataParallel 帶來的 'module.' 前綴問題
-        state_dict = torch.load(snapshot)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
-            else:
-                new_state_dict[k] = v
-        net.load_state_dict(new_state_dict, strict=True)
-    else:
-        print(f"Error: Model not found at {snapshot}")
-        sys.exit(1)
+    # 去掉 module. 前綴（如果有 DataParallel）
+    new_ckpt = { (k[7:] if k.startswith("module.") else k): v for k, v in ckpt.items() }
 
+    ret = net.load_state_dict(new_ckpt, strict=False)
+    print("Loaded:", snapshot)
+    print("Missing:", len(ret.missing_keys), "Unexpected:", len(ret.unexpected_keys))
+    print("Missing sample:", ret.missing_keys[:20])
+    print("Unexpected sample:", ret.unexpected_keys[:20])
 
+    #----------------------------------------------------------------
+    
     snapshot_name = snapshot_path.split('/')[-1]
 
     log_folder = './test_log/test_log_' + args.exp
