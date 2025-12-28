@@ -47,11 +47,11 @@ class DiceLoss(nn.Module):
         class_wise_dice = []
         loss = 0.0
         target = target.float()
-        for i in range(0, self.n_classes):
+        for i in range(1, self.n_classes):# skip background
             dice = self._dice_loss(inputs[:, i], target[:, i])
             class_wise_dice.append(1.0 - dice.item())
             loss += dice * weight[i]
-        return loss / self.n_classes
+        return loss / (self.n_classes-1)
 
 
 def calculate_metric_percase(pred, gt):

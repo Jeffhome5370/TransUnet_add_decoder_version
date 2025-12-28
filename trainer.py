@@ -73,16 +73,16 @@ def trainer_synapse(args, model, snapshot_path):
     print("--------------------------------------------------------------")
 
     best_performance = 0.0 # 用來記錄最佳 Dice
-    iterator = tqdm(range(max_epoch), ncols=70)
+    iterator = tqdm(range(max_epoch+1), ncols=70)
     
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     model.train()
-    weights = torch.tensor(
-        [1.0] + [3.0] * (num_classes - 1),
-        device='cuda'
-    )
-    ce_loss = CrossEntropyLoss(weight=weights)
+    # weights = torch.tensor(
+    #     [1.0] + [3.0] * (num_classes - 1),
+    #     device='cuda'
+    # )
+    #ce_loss = CrossEntropyLoss(weight=weights)
     #ce_loss = CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes)
 
@@ -92,8 +92,13 @@ def trainer_synapse(args, model, snapshot_path):
     # ------------------------------------------------------------------
     # 原本: optimizer = optim.SGD(model.parameters(), ...)
     # 修改後: 過濾 requires_grad=True 的參數
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    #確認trainable params & optimizer 真的吃到它
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.0001)
+    print("Trainable param tensors:", len(trainable_params))
+    print("Trainable param elements:", sum(p.numel() for p in trainable_params))
+    print("Optimizer param groups:", len(optimizer.param_groups))
+    print("Params in group0:", len(optimizer.param_groups[0]["params"]))
     # ------------------------------------------------------------------
 
     writer = SummaryWriter(snapshot_path + '/log')
@@ -102,39 +107,71 @@ def trainer_synapse(args, model, snapshot_path):
     logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+    count = 0
     for epoch_num in iterator:
         model.train()
+        
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
-            model_outputs = model(image_batch)
+
+            if label_batch.dim() == 4 and label_batch.size(1) == 1:
+                label_ce = label_batch.squeeze(1)
+            else:
+                label_ce = label_batch
+            
+            class_logits, masks = model(image_batch)     # class_logits: (B,Q,C), masks: list[(B,Q,h,w)]
             # 新模型的輸出是 (class_logits, refined_masks_list)
             # 我們取出最後一層的 Mask 預測
             # 形狀通常是 (B, num_queries, 14, 14)
-            _, refined_masks = model_outputs
-            outputs = refined_masks[-1] 
+            mask_logits = masks[-1]                      # (B,Q,h,w)
+            
             
             # 執行上採樣 (Upsampling) 到圖片原始大小 (例如 224x224)
             # 因為 Transformer Decoder 在 Patch Level 運作
-            outputs = F.interpolate(outputs, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
+            mask_logits = F.interpolate(mask_logits, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
             
-            # 重要假設：
-            # 這裡假設 num_queries == num_classes。
-            # 如果你的 Query 數量 (20) 與 類別數量 (9) 不同，標準 Dice/CE Loss 會報錯。
-            # 在這種簡單實作下，請在 train.py 確保 --num_queries 等於 --num_classes
-            # ------------------------------------------------------------------
-            loss_ce = ce_loss(outputs, label_batch[:].long())
-            loss_dice = dice_loss(outputs, label_batch, softmax=True)
+            mask_probs  = torch.sigmoid(mask_logits)     # (B,Q,H,W)  (mask 用 sigmoid)
+            class_probs = torch.softmax(class_logits, dim=-1)  # (B,Q,C) (class 用 softmax)
+            semantic_prob = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+            semantic_prob = semantic_prob + 1e-7  # 用加法，不用 clamp
+            semantic_prob_norm = semantic_prob / (
+                semantic_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            )
+
+            #-----------檢查每個 pixel 的 9 類加起來平均是多少---------------------------------------
+            if iter_num % 50 == 0:
+                print("DEBUG sum prob mean (raw):", semantic_prob.sum(dim=1).mean().item())
+                print("DEBUG sum prob mean (norm):", semantic_prob_norm.sum(dim=1).mean().item())  # 應≈1
+                print("mask_logits mean/min/max:",
+                    mask_logits.mean().item(), mask_logits.min().item(), mask_logits.max().item())
+                print("mask_probs mean/min/max:",
+                    mask_probs.mean().item(), mask_probs.min().item(), mask_probs.max().item())
+                print("class_probs mean/min/max:",
+                    class_probs.mean().item(), class_probs.min().item(), class_probs.max().item())
+            #-------------------------------------------------------------------------------------
+
+            loss_ce = F.nll_loss(torch.log(semantic_prob_norm), label_ce.long())
+            loss_dice = dice_loss(semantic_prob_norm, label_ce, softmax=False)  # 因為已是 prob，不要再 softmax
             loss = 0.5 * loss_ce + 0.5 * loss_dice
             optimizer.zero_grad()
             loss.backward()
-            
+            #-----------check grad_norm---------------------------
+            if iter_num % 50 == 0:
+                total_norm = torch.norm(torch.stack([
+                    p.grad.detach().norm(2)
+                    for p in trainable_params
+                    if p.grad is not None
+                ]), 2).item()
+                print("DEBUG grad_norm (before clip):", total_norm)
+            #-----------------------------------------------------
             torch.nn.utils.clip_grad_norm_(
                 trainable_params,   # 或 model.parameters()
                 max_norm=1.0
             )
             optimizer.step()
-            lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+            min_lr = base_lr * 0.05   # 例如保留 5% 的 base_lr
+            lr_ = min_lr + (base_lr - min_lr) * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_
 
@@ -160,10 +197,10 @@ def trainer_synapse(args, model, snapshot_path):
                 image_show = (image_show - image_show.min()) / (image_show.max() - image_show.min() + 1e-8)
 
                 # 2. 準備預測 Mask (Argmax 轉成 0-8 的整數)
-                pred_mask = torch.argmax(torch.softmax(outputs, dim=1), dim=1)[0].cpu().detach().numpy()
+                pred_mask = semantic_prob_norm.argmax(dim=1)[0].cpu().numpy()
                 
                 # 3. 準備 Ground Truth Mask
-                gt_mask = label_batch[0].cpu().detach().numpy()
+                gt_mask = label_ce[0].cpu().numpy()
 
                 # 4. 上傳到 WandB (使用 class_labels)
                 wandb.log({
@@ -206,11 +243,23 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 for i_val, val_batch in tqdm(enumerate(valloader), total=len(valloader), desc=f"Validating Epoch {epoch_num}"):
                     val_img, val_label = val_batch['image'].cuda(), val_batch['label'].cuda()
+
+                    if val_label.dim() == 4 and val_label.size(1) == 1:
+                        val_label_ce = val_label.squeeze(1)
+                    elif val_label.dim() == 3:
+                        val_label_ce = val_label
+                    elif val_label.dim() == 5:  # 你原本的保險
+                        val_label_ce = val_label.squeeze(2)
+                        if val_label_ce.dim() == 4 and val_label_ce.size(1) == 1:
+                            val_label_ce = val_label_ce.squeeze(1)
+                    else:
+                        val_label_ce = val_label
                     
                     # --- Validation Forward ---
                     if args.add_decoder:
-                        _, val_masks = model(val_img)
-                        val_out = val_masks
+                        _, val_out = model(val_img)
+                        val_out = val_out + 1e-7
+                        val_out = val_out / (val_out.sum(dim=1, keepdim=True).clamp_min(1e-6))
                         #val_out = F.interpolate(val_out, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
                     else:
                         val_out = model(val_img)
@@ -227,12 +276,9 @@ def trainer_synapse(args, model, snapshot_path):
                     # --- 計算 Dice Score ---
                     # 這裡為了效率，直接利用 DiceLoss 計算 (Dice = 1 - DiceLoss)
                     # 這樣可以快速得到 Batch 平均 Dice，不用做複雜的 Metric 計算
-                    #print(f"DEBUG: Out={val_out.shape}, Label={val_label.shape}")
-                    v_loss_dice = dice_loss(val_out, val_label, softmax=False)
-                    # [Debug] 印出形狀確認 (如果還是報錯，請看這裡印出的數字)
-                    #print(f"DEBUG: Out={val_out.shape}, Label={val_label.shape}")
-                    val_dice = 1.0 - v_loss_dice.item()
-                    
+                    loss_ce = F.nll_loss(torch.log(val_out), val_label_ce.long())
+                    v_loss_dice = dice_loss(val_out, val_label_ce, softmax=False)
+                    val_dice = 1.0 - float(v_loss_dice.item())
                     val_dice_sum += val_dice
                     num_val_batches += 1
             
