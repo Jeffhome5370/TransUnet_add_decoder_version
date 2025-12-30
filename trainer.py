@@ -364,6 +364,7 @@ def trainer_synapse(args, model, snapshot_path):
             den_raw = mask_probs.sum(dim=1)  # (B,H,W) 真的 coverage
             den = den_raw.clamp_min(0.2)    # 用於除法的安全版
             semantic_logits = semantic_logits / den.unsqueeze(1)
+            semantic_logits[:, 1:] += 0.2
             
             # ======================================================
             # Losses
