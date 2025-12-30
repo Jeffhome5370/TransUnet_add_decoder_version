@@ -159,12 +159,21 @@ def trainer_synapse(args, model, snapshot_path):
                 mask_probs
             )  # (B,C,H,W)
 
-            den = mask_probs.sum(dim=1).clamp_min(1e-6)  # (B,H,W)
+            den_raw = mask_probs.sum(dim=1)  # (B,H,W) 真的 coverage
+            den = den_raw.clamp_min(1e-6)    # 用於除法的安全版
             semantic_logits = semantic_logits / den.unsqueeze(1)
-
+            
             # ======================================================
             # Losses
             # ======================================================
+
+            # coverage regularization：希望 den_raw 不要太常 < 0.3
+            loss_den = F.relu(0.3 - den_raw).mean()
+            
+            #限制單一 query 面積過大
+            area = mask_probs.mean(dim=(2,3))           # (B,Q)
+            max_area = area.max(dim=1).values.mean()   # scalar
+            loss_area = F.relu(max_area - 0.20) ** 2
 
             # ---- Cross Entropy（保守穩定權重）----
             label_ce = label_ce.long()
@@ -225,11 +234,13 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_dice = 4.0
             elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.6:      # <1%
                 lambda_dice = 3.0
-            elif pred_fg_ratio < 0.05 or p_bg_on_fg > 0.4:      # <5%
-                lambda_dice = 2.0
             else:
-                lambda_dice = 1.0
+                lambda_dice = 2.0
+            
+
             loss = loss_ce + lambda_dice * loss_dice
+            loss = loss + 1e-3 * loss_den
+            loss = loss + 3e-4 * loss_area
 
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 50 == 0:
@@ -342,6 +353,9 @@ def trainer_synapse(args, model, snapshot_path):
                 "epoch": epoch_num,
                 "train/pred_fg_ratio": pred_fg_ratio,
                 "train/p_bg_on_fg": p_bg_on_fg,
+                "train/lambda_dice": lambda_dice,
+                "train/loss_den": loss_den.item(),
+                "train/loss_area": loss_area.item(),
                 "train/lambda_dice": lambda_dice,
             })
             writer.add_scalar('info/lr', lr_, iter_num)
