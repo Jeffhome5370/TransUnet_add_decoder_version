@@ -8,11 +8,11 @@ from tqdm import tqdm
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--root_path", type=str, required=True, help="Synapse dataset root path")
-    p.add_argument("--list_dir", type=str, required=True, help="Synapse list_dir (same as trainer)")
+    p.add_argument("--root_path", type=str, default='../data/Synapse/train_npz', help="Synapse dataset root path")
+    p.add_argument("--list_dir", type=str, default='./lists/lists_Synapse', help="Synapse list_dir (same as trainer)")
     p.add_argument("--num_classes", type=int, default=9, help="include background, e.g. 9")
     p.add_argument("--split", type=str, default="train_split", help="train_split / val / etc.")
-    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--pin_memory", action="store_true")
     return p.parse_args()
