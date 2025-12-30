@@ -554,7 +554,7 @@ class TransUNet_TransformerDecoder(nn.Module):
         self.class_head = nn.Linear(self.hidden_size, num_classes)
         self.mask_projector = nn.Linear(self.hidden_size, self.hidden_size) # 用於計算 Mask
         #nn.init.constant_(self.mask_projector.bias, 2.0)
-        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * (-2.0))
+        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * (-1.0))
     def forward(self, x):
         # 1. 處理輸入 (若是灰階圖轉為 RGB)
         if x.size(1) == 1:
@@ -588,7 +588,7 @@ class TransUNet_TransformerDecoder(nn.Module):
         scale = self.hidden_size ** 0.5  # sqrt(768) ≈ 27.7
         logits = torch.bmm(queries, F_sequence.transpose(1, 2)) / scale
         #logits = torch.tanh(logits / 3.0) * 3.0
-        T = 1.5
+        T = 1.0
         logits = logits / T
         logits = torch.clamp(logits, -6, 6) 
         logits = logits + self.mask_logit_bias
@@ -641,7 +641,7 @@ class TransUNet_TransformerDecoder(nn.Module):
             semantic_logits = torch.einsum("bqc, bqhw -> bchw", class_logits, mask_probs)
             #semantic_segmentation = torch.softmax(semantic_segmentation, dim=1)
 
-            den = mask_probs.sum(dim=1).clamp_min(1e-6)  # (B,H,W)
+            den = mask_probs.sum(dim=1).clamp_min(0.2)  # (B,H,W)
             semantic_logits = semantic_logits / den.unsqueeze(1)
 
             semantic_prob = torch.softmax(semantic_logits, dim=1)
