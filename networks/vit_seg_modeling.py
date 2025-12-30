@@ -623,12 +623,17 @@ class TransUNet_TransformerDecoder(nn.Module):
             
             # 2. 轉為機率
             mask_probs = torch.sigmoid(final_mask_logits)       # (B, Q, H, W)
-            class_probs = torch.softmax(class_logits, dim=-1)   # (B, Q, Num_Classes)
+            #class_probs = torch.softmax(class_logits, dim=-1)   # (B, Q, Num_Classes)
             
             # 3. 矩陣運算組合: 每個 Pixel 的類別 = 所有 Query 的加權總和
             # einsum: "bqc, bqhw -> bchw"
-            semantic_segmentation = torch.einsum("bqc, bqhw -> bchw", class_probs, mask_probs)
-            semantic_segmentation = torch.softmax(semantic_segmentation, dim=1)
+            semantic_logits = torch.einsum("bqc, bqhw -> bchw", class_logits, mask_probs)
+            #semantic_segmentation = torch.softmax(semantic_segmentation, dim=1)
+
+            den = mask_probs.sum(dim=1).clamp_min(1e-6)  # (B,H,W)
+            semantic_logits = semantic_logits / den.unsqueeze(1)
+
+            semantic_prob = torch.softmax(semantic_logits, dim=1)
             '''
             print("FORWARD DEBUG semantic pre-clamp min/max/mean:",
                 float(semantic_segmentation.min().item()),
@@ -646,14 +651,14 @@ class TransUNet_TransformerDecoder(nn.Module):
 
             #semantic_segmentation = torch.clamp(semantic_segmentation, min=1e-7, max=1-1e-7)
             # 使用雙線性插值 (Bilinear) 恢復成 input_size (512x512)
-            semantic_segmentation = F.interpolate(
-                semantic_segmentation, 
+            semantic_prob  = F.interpolate(
+                semantic_prob , 
                 size= (self.img_size, self.img_size), 
                 mode='bilinear', 
                 align_corners=False
             )
             
-            return None, semantic_segmentation
+            return None, semantic_prob
 
         # 訓練模式回傳 Tuple 供 Loss 計算
         return class_logits, refined_masks

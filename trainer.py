@@ -25,7 +25,18 @@ def worker_init_fn(worker_id):
     # 使用全域變數加上 worker_id
     random.seed(GLOBAL_WORKER_SEED + worker_id)
 
+def build_semantic_logits(model, images, img_size):
+    out = model(images)
 
+    # 兼容：有的 forward 回 (class_logits, masks)，有的回 (None, semantic)
+    if isinstance(out, (tuple, list)):
+        # 若最後一個就是 (B,C,H,W) 的 semantic（例如 eval 模式）
+        if out[-1].dim() == 4 and out[-1].size(1) > 1:
+            return out[-1]  # 當作 logits (或至少是 unnorm scores)
+        class_logits, masks = out[0], out[1]
+    else:
+        # 原版 TransUNet 可能直接回 (B,C,H,W) logits
+        return out
 
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
