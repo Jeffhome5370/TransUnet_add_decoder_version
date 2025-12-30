@@ -135,6 +135,10 @@ def trainer_synapse(args, model, snapshot_path):
             if (label_ce > 0).sum() == 0:
                 if torch.rand(1, device=label_ce.device).item() > bg_keep_prob:
                     continue
+            min_fg_ratio = 0.005  # 0.5% 起手（你可調 0.2%~1%）
+            if (label_ce > 0).float().mean().item() < min_fg_ratio:
+                if torch.rand(1, device=label_ce.device).item() > 0.2:
+                    continue
             class_logits, masks = model(image_batch)     # class_logits: (B,Q,C), masks: list[(B,Q,h,w)]
             # 新模型的輸出是 (class_logits, refined_masks_list)
             # 我們取出最後一層的 Mask 預測
@@ -166,9 +170,33 @@ def trainer_synapse(args, model, snapshot_path):
             label_ce = label_ce.long()
 
             weights = torch.tensor([0.3, 1.2068, 2.3783, 1.0005, 0.9995, 0.3031, 1.4043, 0.6388, 0.6094],
-                       device=semantic_logits.device)
+                                device=semantic_logits.device)
 
-            loss_ce = F.cross_entropy(semantic_logits, label_ce, weight=weights)
+            # per-pixel CE (no reduction)
+            ce_map = F.cross_entropy(semantic_logits, label_ce, weight=weights, reduction="none")  # (B,H,W)
+
+            fg = (label_ce > 0)
+            bg = ~fg
+
+            k = 3  # bg 抽樣倍率：3 起手，若還是偏 BG 可到 5
+            num_fg = int(fg.sum().item())
+
+            if num_fg > 0:
+                fg_idx = fg.flatten().nonzero(as_tuple=False).squeeze(1)
+                bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
+
+                num_bg = min(bg_idx.numel(), k * num_fg)
+                bg_sel = bg_idx[torch.randperm(bg_idx.numel(), device=bg_idx.device)[:num_bg]]
+
+                ce_flat = ce_map.flatten()
+                loss_ce = ce_flat[fg_idx].mean() + ce_flat[bg_sel].mean()
+            else:
+                # 沒前景：只抽少量背景，避免一直強化 BG 解
+                bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
+                num_bg = min(bg_idx.numel(), 4096)
+                bg_sel = bg_idx[torch.randperm(bg_idx.numel(), device=bg_idx.device)[:num_bg]]
+                loss_ce = ce_map.flatten()[bg_sel].mean()
+
 
             # ---- Dice ----
             semantic_prob = torch.softmax(semantic_logits, dim=1)
@@ -180,8 +208,19 @@ def trainer_synapse(args, model, snapshot_path):
             has_fg = (label_ce > 0).any()
 
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
+            
+            # ----fix Loss ratio----
+            pred_fg_ratio = (semantic_prob.argmax(1) > 0).float().mean().item()
 
-            loss = loss_ce + loss_dice
+            if pred_fg_ratio < 0.002:       # <0.2%
+                lambda_dice = 4.0
+            elif pred_fg_ratio < 0.01:      # <1%
+                lambda_dice = 3.0
+            elif pred_fg_ratio < 0.05:      # <5%
+                lambda_dice = 2.0
+            else:
+                lambda_dice = 1.0
+            loss = loss_ce + lambda_dice * loss_dice
 
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 50 == 0:
