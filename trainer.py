@@ -386,34 +386,35 @@ def trainer_synapse(args, model, snapshot_path):
 
             # per-pixel CE (no reduction)
             ce_map = F.cross_entropy(semantic_logits, label_ce, weight=weights, reduction="none")  # (B,H,W)
-
+            ce_flat = ce_map.flatten()
             fg = (label_ce > 0)
             bg = ~fg
-
-            
+            #CE 對所有 GT 前景像素都算，但對 GT 背景像素，只挑「最像前景的那一小撮」來算。
+            p_fg_any = semantic_prob[:, 1:].sum(1)
             num_fg = int(fg.sum().item())
+            # --- FG indices ---
+            fg_idx = gt_fg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
 
-            if num_fg > 0:
-                if num_fg < 1500:
-                    k = 1
-                elif num_fg < 5000:
-                    k = 2
+            # --- BG hard negatives: pick highest p_fg_any on GT_bg ---
+            bg_idx = gt_bg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_bg,)
+
+            if bg_idx.numel() > 0:
+                pfg_flat = p_fg_any.flatten()[bg_idx]                    # (N_bg,)
+                num_bg = min(bg_idx.numel(), 8192)                       # 固定上限，不綁 N_fg
+                if num_bg > 0:
+                    topk = torch.topk(pfg_flat, k=num_bg, largest=True).indices
+                    bg_sel = bg_idx[topk]
                 else:
-                    k = 3
-                fg_idx = fg.flatten().nonzero(as_tuple=False).squeeze(1)
-                bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
+                    bg_sel = bg_idx
+            else:
+                bg_sel = bg_idx  # empty
 
-                num_bg = min(bg_idx.numel(), k * num_fg)
-                bg_sel = bg_idx[torch.randperm(bg_idx.numel(), device=bg_idx.device)[:num_bg]]
-
-                ce_flat = ce_map.flatten()
+            # --- CE loss combine ---
+            if fg_idx.numel() > 0:
                 loss_ce = ce_flat[fg_idx].mean() + ce_flat[bg_sel].mean()
             else:
-                # 沒前景：只抽少量背景，避免一直強化 BG 解
-                bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
-                num_bg = min(bg_idx.numel(), 4096)
-                bg_sel = bg_idx[torch.randperm(bg_idx.numel(), device=bg_idx.device)[:num_bg]]
-                loss_ce = ce_map.flatten()[bg_sel].mean()
+                # 沒前景：只用 hard-negative bg
+                loss_ce = ce_flat[bg_sel].mean()
 
             area_per_q = mask_probs.mean(dim=(2, 3))
             overlap_pen = torch.relu(den_raw - 2.0).pow(2).mean()
@@ -424,8 +425,9 @@ def trainer_synapse(args, model, snapshot_path):
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
             #GT 說是背景的像素上，你的前景機率越高，我就越罰你。
             gt_bg = (label_ce == 0)
-            p_fg_any = semantic_prob[:, 1:].sum(1)  # any-foreground prob
-            loss_fp = p_fg_any[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=semantic_logits.device)
+                
+            p_bg = semantic_prob[:, 0]  # (B,H,W)
+            loss_fp = (-torch.log(p_bg.clamp_min(1e-6))[gt_bg]).mean()
 
             # ---- Total Loss ----
             has_fg = (label_ce > 0).any()
@@ -456,8 +458,8 @@ def trainer_synapse(args, model, snapshot_path):
                     lambda_dice = 0.5
 
             else:
-                if ratio_mult > 5.0:
-                    lambda_dice = 1.0   # 不要再加大了，避免更擴散
+                if ratio_mult > 3.0:
+                    lambda_dice = 0.2   # 不要再加大了，避免更擴散
                 # GT 足夠：這時 Dice 才是有效訊號，可以用來救「全背景偷懶」
                 else:
                     # 全背景偷懶才拉大
@@ -473,14 +475,14 @@ def trainer_synapse(args, model, snapshot_path):
             loss = loss + 1e-3 * loss_den
             loss = loss + 3e-3 * area_pen
             loss = loss + 3e-3 * overlap_pen
-            loss = loss + 1e-2 * loss_fp
+            loss = loss + 0.2 * loss_fp
 
             w_ce      = float(loss_ce.item())
             w_dice    = float((lambda_dice * loss_dice).item())
-            w_den     = float((1e-2 * loss_den).item())
-            w_area    = float((3e-2 * area_pen).item())
-            w_overlap = float((3e-2 * overlap_pen).item())
-            w_fp      = float((1e-2 * loss_fp).item())
+            w_den     = float((1e-3 * loss_den).item())
+            w_area    = float((3e-3 * area_pen).item())
+            w_overlap = float((3e-3 * overlap_pen).item())
+            w_fp      = float((0.2 * loss_fp).item())
 
             w_total = w_ce + w_dice + w_den + w_area + w_overlap + w_fp
             # ===== debug（建議改成看更有意義的東西）=====
@@ -563,10 +565,10 @@ def trainer_synapse(args, model, snapshot_path):
                     print("[LOSS MIX]")
                     print(f"  CE       : {w_ce:.4f} ({w_ce/w_total:.1%})")
                     print(f"  Dice*w   : {w_dice:.4f} ({w_dice/w_total:.1%})  lambda={lambda_dice:.2f}")
-                    print(f"  den*1e-2 : {w_den:.4f} ({w_den/w_total:.1%})")
-                    print(f"  area*3e-2: {w_area:.4f} ({w_area/w_total:.1%})")
-                    print(f"  ovlp*3e-2: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
-                    print(f"  fp*1e-2: {w_fp:.4f} ({w_fp/w_total:.1%})")
+                    print(f"  den*1e-3 : {w_den:.4f} ({w_den/w_total:.1%})")
+                    print(f"  area*3e-3: {w_area:.4f} ({w_area/w_total:.1%})")
+                    print(f"  ovlp*3e-3: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
+                    print(f"  fp*0.2: {w_fp:.4f} ({w_fp/w_total:.1%})")
                     fp_mean = float(p_fg_any[gt_bg].mean().item())
                     fp_q95  = float(torch.quantile(p_fg_any[gt_bg], 0.95).item())
                     print(f"[FP on GT_bg] mean={fp_mean:.4f}, q95={fp_q95:.4f}")
