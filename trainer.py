@@ -385,6 +385,7 @@ def trainer_synapse(args, model, snapshot_path):
                                 device=semantic_logits.device)
 
             # per-pixel CE (no reduction)
+            semantic_prob = torch.softmax(semantic_logits, dim=1)
             ce_map = F.cross_entropy(semantic_logits, label_ce, weight=weights, reduction="none")  # (B,H,W)
             ce_flat = ce_map.flatten()
             fg = (label_ce > 0)
@@ -419,7 +420,7 @@ def trainer_synapse(args, model, snapshot_path):
             area_per_q = mask_probs.mean(dim=(2, 3))
             overlap_pen = torch.relu(den_raw - 2.0).pow(2).mean()
             # ---- Dice ----
-            semantic_prob = torch.softmax(semantic_logits, dim=1)
+            #semantic_prob = torch.softmax(semantic_logits, dim=1)
             has_fg = (label_ce > 0).any()
 
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
