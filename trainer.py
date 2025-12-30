@@ -575,7 +575,7 @@ def trainer_synapse(args, model, snapshot_path):
                 "train/p_bg_on_fg": p_bg_on_fg,
                 "train/lambda_dice": lambda_dice,
                 "train/loss_den": loss_den.item(),
-                "train/loss_area": loss_area.item(),
+                "train/loss_area": area_pen.item(),
                 "train/lambda_dice": lambda_dice,
             })
             writer.add_scalar('info/lr', lr_, iter_num)
