@@ -440,6 +440,9 @@ def trainer_synapse(args, model, snapshot_path):
             else:
                 p_bg_on_fg = 1.0
 
+            gt_fg = (label_ce > 0)
+            gt_fg_ratio = gt_fg.float().mean().item()
+            ratio_mult = pred_fg_ratio / (gt_fg_ratio + 1e-8)
             if gt_fg_ratio < 0.01:
                 # GT 超少：Dice 容易變噪音，先不要拉太大
                 # 只在「真的快變全背景」時稍微拉一下
@@ -449,13 +452,17 @@ def trainer_synapse(args, model, snapshot_path):
                     lambda_dice = 0.5
 
             else:
+                if ratio_mult > 8.0:
+                    lambda_dice = 1.0   # 不要再加大了，避免更擴散
                 # GT 足夠：這時 Dice 才是有效訊號，可以用來救「全背景偷懶」
-                if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.80:
-                    lambda_dice = 4.0
-                elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.60:
-                    lambda_dice = 3.0
                 else:
-                    lambda_dice = 2.0
+                    # 全背景偷懶才拉大
+                    if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.80:
+                        lambda_dice = 4.0
+                    elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.60:
+                        lambda_dice = 3.0
+                    else:
+                        lambda_dice = 2.0
             
 
             loss = loss_ce + lambda_dice * loss_dice
