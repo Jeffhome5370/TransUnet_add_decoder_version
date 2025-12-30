@@ -452,8 +452,11 @@ def trainer_synapse(args, model, snapshot_path):
             gt_fg = (label_ce > 0)
             gt_fg_ratio = gt_fg.float().mean().item()
             ratio_mult = pred_fg_ratio / (gt_fg_ratio + 1e-8)
-
-            # (1) 最高優先：亂噴前景就壓 Dice（不分 gt_fg_ratio）
+            
+            # 最高優先：argmax 已經全背景 → 不能再讓 Dice 主導
+            if pred_fg_ratio == 0.0:
+                lambda_dice = 0.5 
+            # 亂噴前景就壓 Dice（不分 gt_fg_ratio）
             if ratio_mult > 3.0:
                 lambda_dice = 0.2
 
@@ -474,19 +477,24 @@ def trainer_synapse(args, model, snapshot_path):
                     else:
                         lambda_dice = 2.0
             
+            lambda_fp = 0.1
+            if pred_fg_ratio == 0.0:
+                lambda_fp_eff = 0.0
+            else:
+                lambda_fp_eff = lambda_fp
 
             loss = loss_ce + lambda_dice * loss_dice
             loss = loss + 1e-3 * loss_den
             loss = loss + 3e-3 * area_pen
             loss = loss + 3e-3 * overlap_pen
-            loss = loss + 0.2 * loss_fp
+            loss = loss + lambda_fp_eff * loss_fp
 
             w_ce      = float(loss_ce.item())
             w_dice    = float((lambda_dice * loss_dice).item())
             w_den     = float((1e-3 * loss_den).item())
             w_area    = float((3e-3 * area_pen).item())
             w_overlap = float((3e-3 * overlap_pen).item())
-            w_fp      = float((0.2 * loss_fp).item())
+            w_fp      = float((lambda_fp_eff * loss_fp).item())
 
             w_total = w_ce + w_dice + w_den + w_area + w_overlap + w_fp
             # ===== debug（建議改成看更有意義的東西）=====
@@ -572,7 +580,7 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"  den*1e-3 : {w_den:.4f} ({w_den/w_total:.1%})")
                     print(f"  area*3e-3: {w_area:.4f} ({w_area/w_total:.1%})")
                     print(f"  ovlp*3e-3: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
-                    print(f"  fp*0.2: {w_fp:.4f} ({w_fp/w_total:.1%})")
+                    print(f"  fp*{lambda_fp_eff:.4f}: {w_fp:.4f} ({w_fp/w_total:.1%})")
                     fp_mean = float(p_fg_any[gt_bg].mean().item())
                     fp_q95  = float(torch.quantile(p_fg_any[gt_bg], 0.95).item())
                     print(f"[FP on GT_bg] mean={fp_mean:.4f}, q95={fp_q95:.4f}")
