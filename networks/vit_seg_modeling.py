@@ -588,8 +588,10 @@ class TransUNet_TransformerDecoder(nn.Module):
         scale = self.hidden_size ** 0.5  # sqrt(768) ≈ 27.7
         logits = torch.bmm(queries, F_sequence.transpose(1, 2)) / scale
         #logits = torch.tanh(logits / 3.0) * 3.0
+        T = 1.5
+        logits = logits / T
+        logits = torch.clamp(logits, -6, 6) 
         logits = logits + self.mask_logit_bias
-        logits = torch.clamp(logits, -6, 10) 
         current_mask = torch.sigmoid(logits) # (B, Q, L)
 
         refined_masks = []
@@ -603,8 +605,9 @@ class TransUNet_TransformerDecoder(nn.Module):
             mask_embed = self.mask_projector(queries)
             logits = torch.bmm(mask_embed, F_sequence.transpose(1, 2)) / scale
             #logits = torch.tanh(logits / 3.0) * 3.0
+            logits = logits / T
             logits = logits + self.mask_logit_bias
-            logits = torch.clamp(logits, -6, 10)
+            logits = torch.clamp(logits, -6, 6)
             current_mask = torch.sigmoid(logits)
             
             # Reshape 回空間維度 (B, Q, H, W)

@@ -38,6 +38,208 @@ def build_semantic_logits(model, images, img_size):
         # 原版 TransUNet 可能直接回 (B,C,H,W) logits
         return out
 
+def check_health(
+    *,
+    iter_num: int,
+    prob_sum_mean: float,
+    gt_fg_ratio: float,
+    pred_fg_ratio: float,
+    pred_unique: list,
+    s_min: float,
+    s_max: float,
+    logit_margin_mean: float,
+    den_min: float,
+    den_max: float,
+    mask_mean: float,
+    area_q_min: float,
+    area_q_max: float,
+    p_gt_fg_mean: float | None = None,
+    p_bg_fg_mean: float | None = None,
+    # 可依你任務調整的門檻（先給 Synapse/多器官/Q~20 的實務值）
+    cfg: dict | None = None,
+):
+    """
+    Print health status as OK/WARN/BAD based on debug metrics.
+    Returns: (status_str, issues_list)
+    """
+
+    default_cfg = {
+        # prob_sum_mean
+        "prob_sum_ok": (0.999, 1.001),
+        "prob_sum_warn": (0.995, 1.005),
+
+        # pred_fg_ratio sanity (Synapse 常見 1%~8%，但 batch/slice 會波動)
+        "pred_fg_bad_low": 0.002,   # 幾乎全背景
+        "pred_fg_warn_low": 0.005,
+        "pred_fg_warn_high": 0.20,  # 偏亂噴（保守）
+        "pred_fg_bad_high": 0.30,   # 幾乎全前景
+
+        # pred vs gt ratio (只做弱檢查；gt 可能很小)
+        "pred_gt_warn_mult_low": 0.3,
+        "pred_gt_warn_mult_high": 2.0,
+
+        # semantic_logits range (避免 den 放大爆掉)
+        "slogit_warn_abs": 12.0,
+        "slogit_bad_abs": 20.0,
+
+        # logit_margin
+        "margin_warn_low": 0.05,  # 太平
+        "margin_ok_low": 0.10,
+        "margin_warn_high": 3.0,  # 太尖（常伴隨 den.min 太低）
+        "margin_bad_high": 5.0,
+
+        # mask_probs mean
+        "mask_mean_warn_low": 0.05,
+        "mask_mean_ok_low": 0.08,
+        "mask_mean_ok_high": 0.20,
+        "mask_mean_warn_high": 0.25,
+
+        # den stability
+        "den_min_ok": 0.15,
+        "den_min_warn": 0.10,
+        "den_min_bad": 0.05,
+        "den_max_warn": 8.0,
+
+        # area_per_q max/min
+        "area_max_ok": 0.22,
+        "area_max_warn": 0.28,
+        "area_max_bad": 0.35,
+        "area_min_warn": 0.005,  # 太多 query 死掉的徵兆
+
+        # on-GT-fg probs (若有 GT fg 才有效)
+        "p_bg_on_fg_ok": 0.50,
+        "p_bg_on_fg_warn": 0.70,
+        "p_bg_on_fg_bad": 0.85,
+        "p_gt_on_fg_ok": 0.15,
+        "p_gt_on_fg_warn": 0.08,
+    }
+
+    if cfg is not None:
+        default_cfg.update(cfg)
+    c = default_cfg
+
+    issues = []  # (severity, message)
+    def add(sev: str, msg: str):
+        issues.append((sev, msg))
+
+    # 1) prob_sum_mean
+    lo_ok, hi_ok = c["prob_sum_ok"]
+    lo_w, hi_w = c["prob_sum_warn"]
+    if not (lo_w <= prob_sum_mean <= hi_w):
+        add("BAD", f"prob_sum_mean={prob_sum_mean:.4f} (prob not normalized?)")
+    elif not (lo_ok <= prob_sum_mean <= hi_ok):
+        add("WARN", f"prob_sum_mean={prob_sum_mean:.4f} (slightly off 1.0)")
+
+    # 2) pred_fg_ratio extremes
+    if pred_fg_ratio < c["pred_fg_bad_low"]:
+        add("BAD", f"pred_fg_ratio={pred_fg_ratio:.4f} (near-all background collapse)")
+    elif pred_fg_ratio < c["pred_fg_warn_low"]:
+        add("WARN", f"pred_fg_ratio={pred_fg_ratio:.4f} (very low foreground)")
+    elif pred_fg_ratio > c["pred_fg_bad_high"]:
+        add("BAD", f"pred_fg_ratio={pred_fg_ratio:.4f} (near-all foreground / noisy)")
+    elif pred_fg_ratio > c["pred_fg_warn_high"]:
+        add("WARN", f"pred_fg_ratio={pred_fg_ratio:.4f} (high foreground; check noise)")
+
+    # pred vs gt (只做弱檢查：gt 可能接近 0)
+    if gt_fg_ratio > 1e-6:
+        mult = pred_fg_ratio / gt_fg_ratio
+        if mult < c["pred_gt_warn_mult_low"] or mult > c["pred_gt_warn_mult_high"]:
+            add("WARN", f"pred/gt fg ratio mult={mult:.2f} (gt={gt_fg_ratio:.4f}, pred={pred_fg_ratio:.4f})")
+
+    # 3) semantic logits range (abs)
+    abs_max = max(abs(s_min), abs(s_max))
+    if abs_max > c["slogit_bad_abs"]:
+        add("BAD", f"semantic_logits abs_max≈{abs_max:.2f} (likely den too small / scale blow-up)")
+    elif abs_max > c["slogit_warn_abs"]:
+        add("WARN", f"semantic_logits abs_max≈{abs_max:.2f} (scale a bit large)")
+
+    # 4) margin
+    if logit_margin_mean < c["margin_warn_low"]:
+        add("WARN", f"logit_margin_mean={logit_margin_mean:.3f} (too flat / weak class separation)")
+    if logit_margin_mean > c["margin_bad_high"]:
+        add("BAD", f"logit_margin_mean={logit_margin_mean:.3f} (too sharp; often unstable)")
+    elif logit_margin_mean > c["margin_warn_high"]:
+        add("WARN", f"logit_margin_mean={logit_margin_mean:.3f} (very sharp; check den_min)")
+
+    # 5) mask mean
+    if mask_mean < c["mask_mean_warn_low"]:
+        add("WARN", f"mask_probs.mean={mask_mean:.4f} (queries cover too little; risk all-BG)")
+    elif mask_mean > c["mask_mean_warn_high"]:
+        add("WARN", f"mask_probs.mean={mask_mean:.4f} (queries too large; risk all-FG)")
+
+    # 6) den stability
+    if den_min < c["den_min_bad"]:
+        add("BAD", f"den.min={den_min:.4f} (VERY small => semantic_logits blown up)")
+    elif den_min < c["den_min_warn"]:
+        add("WARN", f"den.min={den_min:.4f} (small; consider clamp_min ~0.15-0.25)")
+    elif den_min < c["den_min_ok"]:
+        add("WARN", f"den.min={den_min:.4f} (borderline; watch stability)")
+
+    if den_max > c["den_max_warn"]:
+        add("WARN", f"den.max={den_max:.2f} (many queries overlap heavily)")
+
+    # 7) area per query
+    if area_q_max > c["area_max_bad"]:
+        add("BAD", f"area_per_q.max={area_q_max:.4f} (query dominates; collapse likely)")
+    elif area_q_max > c["area_max_warn"]:
+        add("WARN", f"area_per_q.max={area_q_max:.4f} (one query too large)")
+    elif area_q_max > c["area_max_ok"]:
+        add("WARN", f"area_per_q.max={area_q_max:.4f} (slightly high; consider mild area cap)")
+
+    if area_q_min < c["area_min_warn"]:
+        add("WARN", f"area_per_q.min={area_q_min:.4f} (many queries might be dead)")
+
+    # 8) on-GT-fg probs (if available)
+    if p_bg_fg_mean is not None and p_gt_fg_mean is not None:
+        if p_bg_fg_mean > c["p_bg_on_fg_bad"]:
+            add("BAD", f"p(bg|GT_fg)={p_bg_fg_mean:.3f} (model insists BG on GT fg)")
+        elif p_bg_fg_mean > c["p_bg_on_fg_warn"]:
+            add("WARN", f"p(bg|GT_fg)={p_bg_fg_mean:.3f} (still BG-heavy on GT fg)")
+        elif p_bg_fg_mean > c["p_bg_on_fg_ok"]:
+            add("WARN", f"p(bg|GT_fg)={p_bg_fg_mean:.3f} (borderline)")
+
+        if p_gt_fg_mean < c["p_gt_on_fg_warn"]:
+            add("WARN", f"p(gt|GT_fg)={p_gt_fg_mean:.3f} (very low; learning weak)")
+        elif p_gt_fg_mean < c["p_gt_on_fg_ok"]:
+            add("WARN", f"p(gt|GT_fg)={p_gt_fg_mean:.3f} (low; should rise over time)")
+
+    # Decide overall status
+    status = "OK"
+    if any(sev == "BAD" for sev, _ in issues):
+        status = "BAD"
+    elif any(sev == "WARN" for sev, _ in issues):
+        status = "WARN"
+
+    # Print summary
+    print(f"[HEALTH] iter={iter_num} => {status}")
+    if issues:
+        # BAD first, then WARN
+        for sev in ("BAD", "WARN"):
+            for s, msg in issues:
+                if s == sev:
+                    print(f"  - {sev}: {msg}")
+    else:
+        print("  - OK: no issues detected")
+
+    # Quick hints (optional)
+    if status != "OK":
+        hints = []
+        if den_min < c["den_min_warn"]:
+            hints.append("Consider den clamp_min (e.g., 0.15~0.25) in semantic_logits normalization.")
+        if area_q_max > c["area_max_warn"]:
+            hints.append("Consider mild area cap regularizer to prevent one query dominating.")
+        if pred_fg_ratio < c["pred_fg_warn_low"]:
+            hints.append("Foreground too low; dice weight or BG sampling/weights may be too BG-favoring.")
+        if pred_fg_ratio > c["pred_fg_warn_high"]:
+            hints.append("Foreground too high; check mask saturation or class weights causing over-FG.")
+        if hints:
+            print("  Hints:")
+            for h in hints[:3]:
+                print(f"   * {h}")
+
+    return status, issues
+
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
     # --- 修改 3: 在這裡更新全域種子，確保吃到 args.seed ---
@@ -160,7 +362,7 @@ def trainer_synapse(args, model, snapshot_path):
             )  # (B,C,H,W)
 
             den_raw = mask_probs.sum(dim=1)  # (B,H,W) 真的 coverage
-            den = den_raw.clamp_min(1e-6)    # 用於除法的安全版
+            den = den_raw.clamp_min(0.2)    # 用於除法的安全版
             semantic_logits = semantic_logits / den.unsqueeze(1)
             
             # ======================================================
@@ -172,8 +374,9 @@ def trainer_synapse(args, model, snapshot_path):
             
             #限制單一 query 面積過大
             area = mask_probs.mean(dim=(2,3))           # (B,Q)
-            max_area = area.max(dim=1).values.mean()   # scalar
-            loss_area = F.relu(max_area - 0.20) ** 2
+            max_area = 0.22 
+            area_pen = torch.relu(area - max_area).pow(2).mean()   # scalar
+            
 
             # ---- Cross Entropy（保守穩定權重）----
             label_ce = label_ce.long()
@@ -240,7 +443,7 @@ def trainer_synapse(args, model, snapshot_path):
 
             loss = loss_ce + lambda_dice * loss_dice
             loss = loss + 1e-3 * loss_den
-            loss = loss + 3e-4 * loss_area
+            loss = loss + 3e-4 * area_pen
 
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 50 == 0:
@@ -319,7 +522,24 @@ def trainer_synapse(args, model, snapshot_path):
                     else:
                         print("[on GT fg pixels] N/A (no fg in GT)")
                     print("=================")
-                                    
+            if iter_num % 200 == 0:
+                check_health(
+                    iter_num=iter_num,
+                    prob_sum_mean=prob_sum_mean,
+                    gt_fg_ratio=gt_fg_ratio,
+                    pred_fg_ratio=pred_fg_ratio,
+                    pred_unique=pred_unique,
+                    s_min=s_min,
+                    s_max=s_max,
+                    logit_margin_mean=logit_margin_mean,
+                    den_min=den_min,
+                    den_max=den_max,
+                    mask_mean=float(mask_probs.mean().item()),
+                    area_q_min=area_q_min,
+                    area_q_max=area_q_max,
+                    p_gt_fg_mean=(None if not gt_fg.any() else p_gt_fg_mean),
+                    p_bg_fg_mean=(None if not gt_fg.any() else p_bg_fg_mean),
+                )                    
             # ==========================================
             optimizer.zero_grad()
             loss.backward()
