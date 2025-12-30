@@ -163,11 +163,12 @@ def trainer_synapse(args, model, snapshot_path):
             # ======================================================
 
             # ---- Cross Entropy（保守穩定權重）----
-            ce_map = F.cross_entropy(semantic_logits, label_ce, reduction='none')  # (B,H,W)
-            fg_w, bg_w = 6.0, 1.0
-            fg_mask = (label_ce > 0)
-            bg_mask = ~fg_mask
-            loss_ce = (ce_map[fg_mask].mean() * fg_w) + (ce_map[bg_mask].mean() * bg_w)
+            label_ce = label_ce.long()
+
+            weights = torch.tensor([0.3, 1.2068, 2.3783, 1.0005, 0.9995, 0.3031, 1.4043, 0.6388, 0.6094],
+                       device=semantic_logits.device)
+
+            loss_ce = F.cross_entropy(semantic_logits, label_ce, weight=weights)
 
             # ---- Dice ----
             semantic_prob = torch.softmax(semantic_logits, dim=1)
