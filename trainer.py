@@ -416,7 +416,7 @@ def trainer_synapse(args, model, snapshot_path):
                 loss_ce = ce_map.flatten()[bg_sel].mean()
 
             area_per_q = mask_probs.mean(dim=(2, 3))
-            overlap_pen = torch.relu(den_raw - 3.0).pow(2).mean()
+            overlap_pen = torch.relu(den_raw - 2.0).pow(2).mean()
             # ---- Dice ----
             semantic_prob = torch.softmax(semantic_logits, dim=1)
             has_fg = (label_ce > 0).any()
@@ -460,10 +460,10 @@ def trainer_synapse(args, model, snapshot_path):
 
             loss = loss_ce + lambda_dice * loss_dice
             loss = loss + 1e-3 * loss_den
-            loss = loss + 3e-4 * area_pen
-            loss = loss + 3e-4 * overlap_pen
+            loss = loss + 3e-3 * area_pen
+            loss = loss + 3e-3 * overlap_pen
             # ===== debug（建議改成看更有意義的東西）=====
-            if iter_num % 50 == 0:
+            if iter_num % 100 == 0:
                 with torch.no_grad():
                     # -------- 基本張量 --------
                     prob = semantic_prob                   # (B,C,H,W)
@@ -526,6 +526,11 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[mask_probs]  mean/min/max: {float(mask_probs.mean()):.4f} / {float(mask_probs.min()):.4f} / {float(mask_probs.max()):.4f}")
                     print(f"[den_raw] mean/min/max: {den_raw.mean():.4f} / {den_raw.min():.4f} / {den_raw.max():.4f}")
                     print(f"[den_clamped] mean/min/max: {den.mean():.4f} / {den.min():.4f} / {den.max():.4f}")
+                    # den_raw: (B,H,W)
+                    thr_list = [2, 3, 4, 6]
+                    for t in thr_list:
+                        ratio = (den_raw > t).float().mean().item()
+                        print(f"pixels with den > {t}: {ratio:.4f}")
                     print(f"[area_per_q] mean/min/max: {area_q_mean:.4f} / {area_q_min:.4f} / {area_q_max:.4f}")
 
                     print(f"loss_ce: {float(loss_ce.item()):.4f}")
@@ -534,8 +539,22 @@ def trainer_synapse(args, model, snapshot_path):
                         print(f"[on GT fg pixels] mean p(gt): {p_gt_fg_mean:.4f} | mean p(bg): {p_bg_fg_mean:.4f}")
                     else:
                         print("[on GT fg pixels] N/A (no fg in GT)")
+
+                    w_ce      = float(loss_ce.item())
+                    w_dice    = float((lambda_dice * loss_dice).item())
+                    w_den     = float((1e-3 * loss_den).item())
+                    w_area    = float((3e-3 * area_pen).item())
+                    w_overlap = float((3e-3 * overlap_pen).item())
+
+                    w_total = w_ce + w_dice + w_den + w_area + w_overlap
+                    print("[LOSS MIX]")
+                    print(f"  CE       : {w_ce:.4f} ({w_ce/w_total:.1%})")
+                    print(f"  Dice*w   : {w_dice:.4f} ({w_dice/w_total:.1%})  lambda={lambda_dice:.2f}")
+                    print(f"  den*1e-3 : {w_den:.4f} ({w_den/w_total:.1%})")
+                    print(f"  area*3e-3: {w_area:.4f} ({w_area/w_total:.1%})")
+                    print(f"  ovlp*3e-3: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
                     print("=================")
-            if iter_num % 200 == 0:
+            if iter_num % 100 == 0:
                 check_health(
                     iter_num=iter_num,
                     prob_sum_mean=prob_sum_mean,
