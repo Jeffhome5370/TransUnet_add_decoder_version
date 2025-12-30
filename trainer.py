@@ -214,7 +214,8 @@ def trainer_synapse(args, model, snapshot_path):
 
             prob = semantic_prob                   # (B,C,H,W)
             bg = prob[:, 0]                        # (B,H,W)
-            
+            gt_fg = (label_ce > 0)
+
             if gt_fg.any():
                 p_bg_on_fg = bg[gt_fg].mean().item()
             else:
@@ -387,7 +388,7 @@ def trainer_synapse(args, model, snapshot_path):
         # ================================
         #       Validation Stage
         # ================================
-        if (epoch_num % 5 == 0):
+        if (epoch_num % 1 == 0):
             model.eval()
 
             dice_per_class = {c: [] for c in range(1, args.num_classes)}
