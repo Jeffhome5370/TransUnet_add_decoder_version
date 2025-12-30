@@ -394,7 +394,12 @@ def trainer_synapse(args, model, snapshot_path):
             num_fg = int(fg.sum().item())
 
             if num_fg > 0:
-                k = 2 if num_fg < 2000 else 3   # 前景很少時，背景抽少一點
+                if num_fg < 1500:
+                    k = 1
+                elif num_fg < 5000:
+                    k = 2
+                else:
+                    k = 3
                 fg_idx = fg.flatten().nonzero(as_tuple=False).squeeze(1)
                 bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
 
@@ -410,7 +415,8 @@ def trainer_synapse(args, model, snapshot_path):
                 bg_sel = bg_idx[torch.randperm(bg_idx.numel(), device=bg_idx.device)[:num_bg]]
                 loss_ce = ce_map.flatten()[bg_sel].mean()
 
-
+            area_per_q = mask_probs.mean(dim=(2, 3))
+            overlap_pen = torch.relu(den_raw - 3.0).pow(2).mean()
             # ---- Dice ----
             semantic_prob = torch.softmax(semantic_logits, dim=1)
             has_fg = (label_ce > 0).any()
@@ -434,18 +440,28 @@ def trainer_synapse(args, model, snapshot_path):
             else:
                 p_bg_on_fg = 1.0
 
-            if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.8:       # <0.2%
-                lambda_dice = 4.0
-            elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.6:      # <1%
-                lambda_dice = 3.0
+            if gt_fg_ratio < 0.01:
+                # GT 超少：Dice 容易變噪音，先不要拉太大
+                # 只在「真的快變全背景」時稍微拉一下
+                if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.90:
+                    lambda_dice = 1.0
+                else:
+                    lambda_dice = 0.5
+
             else:
-                lambda_dice = 2.0
+                # GT 足夠：這時 Dice 才是有效訊號，可以用來救「全背景偷懶」
+                if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.80:
+                    lambda_dice = 4.0
+                elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.60:
+                    lambda_dice = 3.0
+                else:
+                    lambda_dice = 2.0
             
 
             loss = loss_ce + lambda_dice * loss_dice
             loss = loss + 1e-3 * loss_den
             loss = loss + 3e-4 * area_pen
-
+            loss = loss + 3e-4 * overlap_pen
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 50 == 0:
                 with torch.no_grad():
