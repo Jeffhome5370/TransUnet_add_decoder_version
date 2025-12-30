@@ -515,7 +515,7 @@ class TransformerDecoderLayer(nn.Module):
         return query
 
 class TransUNet_TransformerDecoder(nn.Module):
-    def __init__(self, original_model, num_classes, num_queries=20, num_decoder_layers=3, img_size=512, decoder_stride=8):
+    def __init__(self, original_model, num_classes, num_queries=20, num_decoder_layers=3, img_size=512, decoder_stride=4):
         super().__init__()
         self.original_model = original_model
         self.config = original_model.config
@@ -589,7 +589,7 @@ class TransUNet_TransformerDecoder(nn.Module):
         logits = torch.bmm(queries, F_sequence.transpose(1, 2)) / scale
         #logits = torch.tanh(logits / 3.0) * 3.0
         logits = logits + self.mask_logit_bias
-        logits = torch.clamp(logits, -6, 6) 
+        logits = torch.clamp(logits, -6, 10) 
         current_mask = torch.sigmoid(logits) # (B, Q, L)
 
         refined_masks = []
@@ -604,7 +604,7 @@ class TransUNet_TransformerDecoder(nn.Module):
             logits = torch.bmm(mask_embed, F_sequence.transpose(1, 2)) / scale
             #logits = torch.tanh(logits / 3.0) * 3.0
             logits = logits + self.mask_logit_bias
-            logits = torch.clamp(logits, -6, 6)
+            logits = torch.clamp(logits, -6, 10)
             current_mask = torch.sigmoid(logits)
             
             # Reshape 回空間維度 (B, Q, H, W)
@@ -620,6 +620,14 @@ class TransUNet_TransformerDecoder(nn.Module):
         if not self.training:
             # 1. 取出最後一層預測
             final_mask_logits = refined_masks[-1]
+
+            # 先把 mask logits 上採樣到 img_size，與 training 完全一致
+            final_mask_logits = F.interpolate(
+                final_mask_logits,
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False
+            )  # (B,Q,512,512)
             
             # 2. 轉為機率
             mask_probs = torch.sigmoid(final_mask_logits)       # (B, Q, H, W)

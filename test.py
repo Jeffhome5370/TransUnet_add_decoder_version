@@ -47,7 +47,7 @@ parser.add_argument('--add_decoder', type=int, default=0, help='1 for add transf
 parser.add_argument('--num_queries', type=int, default=20, help='number of queries for transformer decoder')
 parser.add_argument('--exp_name', type=str, default='BTCV', help='experiment name') # 讓路徑匹配更容易
 parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Transformer decoder')
-parser.add_argument('--decoder_stride', type=int, default=8, help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
+parser.add_argument('--decoder_stride', type=int, default=4, help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
 parser.add_argument('--split', type=str, default='test', choices=['train','val','test'])
 args = parser.parse_args()
 

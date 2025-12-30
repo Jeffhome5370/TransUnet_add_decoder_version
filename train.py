@@ -49,7 +49,7 @@ parser.add_argument('--exp_name', type=str, default=None, help='Name of the expe
 
 parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Transformer decoder')
 
-parser.add_argument('--decoder_stride', type=int, default=8,
+parser.add_argument('--decoder_stride', type=int, default=4,
                     help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
 
 parser.add_argument('--patience', type=int, default=80, help='early_stop')
