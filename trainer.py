@@ -457,7 +457,7 @@ def trainer_synapse(args, model, snapshot_path):
             if pred_fg_ratio == 0.0:
                 lambda_dice = 0.5 
             # 亂噴前景就壓 Dice（不分 gt_fg_ratio）
-            if ratio_mult > 3.0:
+            elif ratio_mult > 3.0:
                 lambda_dice = 0.2
 
             else:
