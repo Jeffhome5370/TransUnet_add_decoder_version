@@ -390,10 +390,11 @@ def trainer_synapse(args, model, snapshot_path):
             fg = (label_ce > 0)
             bg = ~fg
 
-            k = 3  # bg 抽樣倍率：3 起手，若還是偏 BG 可到 5
+            
             num_fg = int(fg.sum().item())
 
             if num_fg > 0:
+                k = 2 if num_fg < 2000 else 3   # 前景很少時，背景抽少一點
                 fg_idx = fg.flatten().nonzero(as_tuple=False).squeeze(1)
                 bg_idx = bg.flatten().nonzero(as_tuple=False).squeeze(1)
 
@@ -472,12 +473,7 @@ def trainer_synapse(args, model, snapshot_path):
                     logit_margin_min  = float(logit_margin.min().item())
                     logit_margin_max  = float(logit_margin.max().item())
 
-                    # -------- mask 相關（找「mask塌陷/全黑」根因）--------
-                    # mask_probs: (B,Q,H,W)
-                    den = mask_probs.sum(dim=1)  # (B,H,W)
-                    den_mean = float(den.mean().item())
-                    den_min  = float(den.min().item())
-                    den_max  = float(den.max().item())
+                    
 
                     # 每個 query 的平均面積分布（看是不是都趨近 0）
                     area_per_q = mask_probs.mean(dim=(2, 3))  # (B,Q)
@@ -512,7 +508,8 @@ def trainer_synapse(args, model, snapshot_path):
 
                     print(f"[mask_logits] mean/min/max: {float(mask_logits.mean()):.4f} / {float(mask_logits.min()):.4f} / {float(mask_logits.max()):.4f}")
                     print(f"[mask_probs]  mean/min/max: {float(mask_probs.mean()):.4f} / {float(mask_probs.min()):.4f} / {float(mask_probs.max()):.4f}")
-                    print(f"[den=sum_q(mask_probs)] mean/min/max: {den_mean:.4f} / {den_min:.4f} / {den_max:.4f}")
+                    print(f"[den_raw] mean/min/max: {den_raw.mean():.4f} / {den_raw.min():.4f} / {den_raw.max():.4f}")
+                    print(f"[den_clamped] mean/min/max: {den.mean():.4f} / {den.min():.4f} / {den.max():.4f}")
                     print(f"[area_per_q] mean/min/max: {area_q_mean:.4f} / {area_q_min:.4f} / {area_q_max:.4f}")
 
                     print(f"loss_ce: {float(loss_ce.item()):.4f}")
@@ -532,8 +529,8 @@ def trainer_synapse(args, model, snapshot_path):
                     s_min=s_min,
                     s_max=s_max,
                     logit_margin_mean=logit_margin_mean,
-                    den_min=den_min,
-                    den_max=den_max,
+                    den_min=den.min,
+                    den_max=den.max,
                     mask_mean=float(mask_probs.mean().item()),
                     area_q_min=area_q_min,
                     area_q_max=area_q_max,
