@@ -394,6 +394,7 @@ def trainer_synapse(args, model, snapshot_path):
             p_fg_any = semantic_prob[:, 1:].sum(1)
             num_fg = int(fg.sum().item())
             # --- FG indices ---
+            gt_fg = (label_ce > 0)
             fg_idx = gt_fg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
 
             # --- BG hard negatives: pick highest p_fg_any on GT_bg ---
