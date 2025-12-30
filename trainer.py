@@ -422,6 +422,10 @@ def trainer_synapse(args, model, snapshot_path):
             has_fg = (label_ce > 0).any()
 
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
+            #GT 說是背景的像素上，你的前景機率越高，我就越罰你。
+            gt_bg = (label_ce == 0)
+            p_fg_any = semantic_prob[:, 1:].sum(1)  # any-foreground prob
+            loss_fp = p_fg_any[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=semantic_logits.device)
 
             # ---- Total Loss ----
             has_fg = (label_ce > 0).any()
@@ -452,7 +456,7 @@ def trainer_synapse(args, model, snapshot_path):
                     lambda_dice = 0.5
 
             else:
-                if ratio_mult > 8.0:
+                if ratio_mult > 5.0:
                     lambda_dice = 1.0   # 不要再加大了，避免更擴散
                 # GT 足夠：這時 Dice 才是有效訊號，可以用來救「全背景偷懶」
                 else:
@@ -469,6 +473,16 @@ def trainer_synapse(args, model, snapshot_path):
             loss = loss + 1e-3 * loss_den
             loss = loss + 3e-3 * area_pen
             loss = loss + 3e-3 * overlap_pen
+            loss = loss + 1e-2 * loss_fp
+
+            w_ce      = float(loss_ce.item())
+            w_dice    = float((lambda_dice * loss_dice).item())
+            w_den     = float((1e-2 * loss_den).item())
+            w_area    = float((3e-2 * area_pen).item())
+            w_overlap = float((3e-2 * overlap_pen).item())
+            w_fp      = float((1e-2 * loss_fp).item())
+
+            w_total = w_ce + w_dice + w_den + w_area + w_overlap + w_fp
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 100 == 0:
                 with torch.no_grad():
@@ -546,20 +560,16 @@ def trainer_synapse(args, model, snapshot_path):
                         print(f"[on GT fg pixels] mean p(gt): {p_gt_fg_mean:.4f} | mean p(bg): {p_bg_fg_mean:.4f}")
                     else:
                         print("[on GT fg pixels] N/A (no fg in GT)")
-
-                    w_ce      = float(loss_ce.item())
-                    w_dice    = float((lambda_dice * loss_dice).item())
-                    w_den     = float((1e-3 * loss_den).item())
-                    w_area    = float((3e-3 * area_pen).item())
-                    w_overlap = float((3e-3 * overlap_pen).item())
-
-                    w_total = w_ce + w_dice + w_den + w_area + w_overlap
                     print("[LOSS MIX]")
                     print(f"  CE       : {w_ce:.4f} ({w_ce/w_total:.1%})")
                     print(f"  Dice*w   : {w_dice:.4f} ({w_dice/w_total:.1%})  lambda={lambda_dice:.2f}")
-                    print(f"  den*1e-3 : {w_den:.4f} ({w_den/w_total:.1%})")
-                    print(f"  area*3e-3: {w_area:.4f} ({w_area/w_total:.1%})")
-                    print(f"  ovlp*3e-3: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
+                    print(f"  den*1e-2 : {w_den:.4f} ({w_den/w_total:.1%})")
+                    print(f"  area*3e-2: {w_area:.4f} ({w_area/w_total:.1%})")
+                    print(f"  ovlp*3e-2: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
+                    print(f"  fp*1e-2: {w_fp:.4f} ({w_fp/w_total:.1%})")
+                    fp_mean = float(p_fg_any[gt_bg].mean().item())
+                    fp_q95  = float(torch.quantile(p_fg_any[gt_bg], 0.95).item())
+                    print(f"[FP on GT_bg] mean={fp_mean:.4f}, q95={fp_q95:.4f}")
                     print("=================")
             if iter_num % 100 == 0:
                 check_health(
