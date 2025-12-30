@@ -370,7 +370,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ======================================================
 
             # coverage regularization：希望 den_raw 不要太常 < 0.3
-            loss_den = F.relu(0.3 - den_raw).mean()
+            loss_den = F.relu(0.3 - den_raw).pow(2).mean()
             
             #限制單一 query 面積過大
             area = mask_probs.mean(dim=(2,3))           # (B,Q)
@@ -529,8 +529,8 @@ def trainer_synapse(args, model, snapshot_path):
                     s_min=s_min,
                     s_max=s_max,
                     logit_margin_mean=logit_margin_mean,
-                    den_min=den.min,
-                    den_max=den.max,
+                    den_min=den.min().item(),
+                    den_max=den.max().item(),
                     mask_mean=float(mask_probs.mean().item()),
                     area_q_min=area_q_min,
                     area_q_max=area_q_max,
