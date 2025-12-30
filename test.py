@@ -15,6 +15,7 @@ from utils import test_single_volume
 from networks.vit_seg_modeling import VisionTransformer as ViT_seg
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from networks.vit_seg_modeling import TransUNet_TransformerDecoder # 新增: 引入 Decoder 類別
+from utils import DiceLoss
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--volume_path', type=str,
@@ -47,37 +48,141 @@ parser.add_argument('--num_queries', type=int, default=20, help='number of queri
 parser.add_argument('--exp_name', type=str, default='BTCV', help='experiment name') # 讓路徑匹配更容易
 parser.add_argument('--decoder_layer', type=int, default=3, help='Numbers of Transformer decoder')
 parser.add_argument('--decoder_stride', type=int, default=8, help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
+parser.add_argument('--split', type=str, default='test', choices=['train','val','test'])
 args = parser.parse_args()
 
+CLASS_LABELS = {
+    1: "Aorta",
+    2: "Gallbladder",
+    3: "Kidney(L)",
+    4: "Kidney(R)",
+    5: "Liver",
+    6: "Pancreas",
+    7: "Spleen",
+    8: "Stomach",
+}
 
 def inference(args, model, test_save_path=None):
-    db_test = args.Dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir)
-    testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
-    logging.info("{} test iterations per epoch".format(len(testloader)))
+    dice_loss = DiceLoss(args.num_classes).cuda()
+    val_dice_sum = 0.0
+    n = 0
+    db_test = Synapse_dataset(
+        base_dir=args.volume_path,
+        list_dir=args.list_dir,
+        split=args.split
+    )
+
+    testloader = DataLoader(
+        db_test,
+        batch_size=1,
+        shuffle=False,
+        num_workers=2
+    )
+
+    logging.info(f"{len(testloader)} {args.split} slices")
     model.eval()
-    metric_list = 0.0
-    for i_batch, sampled_batch in tqdm(enumerate(testloader)):
-        #h, w = sampled_batch["image"].size()[2:]
-        image, label, case_name = sampled_batch["image"], sampled_batch["label"], sampled_batch['case_name'][0]
 
-        metric_i = test_single_volume(image, label, model, classes=args.num_classes, patch_size=[args.img_size, args.img_size],
-                                      test_save_path=test_save_path, case=case_name, z_spacing=args.z_spacing)
-        metric_list += np.array(metric_i)
-        logging.info('idx %d case %s mean_dice %f mean_hd95 %f' % (i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
-    metric_list = metric_list / len(db_test)
+    dice_dict = {c: [] for c in range(1, args.num_classes)}
+    '''
+    with torch.no_grad():
+        for i_batch, batch in tqdm(enumerate(testloader)):
+            image = batch["image"].cuda()   # (B,1,H,W)
+            label = batch["label"].cuda()   # (B,H,W)
+            case_name = batch["case_name"][0] if "case_name" in batch else str(i_batch)
 
-    class_labels = {
-        1: "Aorta", 2: "Gallbladder", 3: "Kidney(L)", 4: "Kidney(R)",
-        5: "Liver", 6: "Pancreas", 7: "Spleen", 8: "Stomach"
-    }
-    for i in range(1, args.num_classes):
-        class_name = class_labels.get(i, f"Class {i}")
-        logging.info('Mean class %d name %s mean_dice %f mean_hd95 %f' % (
-            i, class_name, metric_list[i-1][0], metric_list[i-1][1]))
-    performance = np.mean(metric_list, axis=0)[0]
-    mean_hd95 = np.mean(metric_list, axis=0)[1]
-    logging.info('Testing performance in best val model: mean_dice : %f mean_hd95 : %f' % (performance, mean_hd95))
+            raw_outputs = model(image)
+
+            # ===== debug：只印第一個 batch =====
+            if i_batch == 0:
+                print("case:", case_name)
+                print("label unique:", torch.unique(label).cpu().tolist()[:50])
+
+                print("type(raw_outputs):", type(raw_outputs))
+                if isinstance(raw_outputs, (tuple, list)):
+                    print("len(raw_outputs):", len(raw_outputs))
+                    for k, o in enumerate(raw_outputs):
+                        if torch.is_tensor(o):
+                            print(f"  out[{k}] shape={tuple(o.shape)} "
+                                  f"min={float(o.min()):.4g} max={float(o.max()):.4g} mean={float(o.mean()):.4g}")
+                        else:
+                            print(f"  out[{k}] type={type(o)}")
+                else:
+                    print("raw_outputs shape:", tuple(raw_outputs.shape))
+            # ================================
+
+            # 找到真正的 segmentation logits (B,C,H,W)
+            if isinstance(raw_outputs, (tuple, list)):
+                logits = None
+                for o in raw_outputs:
+                    if torch.is_tensor(o) and o.dim() == 4 and o.size(1) == args.num_classes:
+                        logits = o
+                        break
+                if logits is None:
+                    raise RuntimeError("Cannot find segmentation logits (B,C,H,W) in raw_outputs.")
+            else:
+                logits = raw_outputs
+
+            if (i_batch == 0):
+                bg = logits[:, 0]              # (1,H,W)
+                fg = logits[:, 1:]             # (1,8,H,W)
+                print("bg min/max/mean:", float(bg.min()), float(bg.max()), float(bg.mean()))
+                print("fg max/mean:", float(fg.max()), float(fg.mean()))
+            pred = torch.argmax(logits, dim=1)  # (B,H,W)
+
+            if i_batch == 0:
+                print("pred unique :", torch.unique(pred).cpu().tolist()[:50])
+                print("pred fg ratio:", float((pred > 0).float().mean().item()))
+
+            # ✅ 這段就是你剛剛註解掉的核心：一定要放回來
+            for cls in range(1, args.num_classes):
+                gt = (label == cls)
+                pd = (pred == cls)
+
+                if gt.sum() == 0:
+                    continue
+
+                intersect = (gt & pd).sum().float()
+                dice = (2 * intersect) / (gt.sum() + pd.sum() + 1e-5)
+                dice_dict[cls].append(dice.item())
+
+    logging.info("===== Per-class Dice (slice-level) =====")
+    for cls, name in CLASS_LABELS.items():
+        if len(dice_dict[cls]) == 0:
+            logging.info(f"{name:12s}: N/A (no GT slices)")
+        else:
+            logging.info(f"{name:12s}: Dice = {np.mean(dice_dict[cls]):.4f} (n={len(dice_dict[cls])})")
+
     return "Testing Finished!"
+    '''
+    with torch.no_grad():
+        for i_batch, batch in tqdm(enumerate(testloader)):
+            image = batch["image"].cuda()
+            label = batch["label"].cuda()
+
+            raw = model(image)
+            if isinstance(raw, (tuple, list)):
+                val_out = raw[-1]
+            else:
+                val_out = raw
+
+            # trainer validation 的做法：先確保每像素 sum=1
+            val_out = val_out + 1e-7
+            val_out = val_out / (val_out.sum(dim=1, keepdim=True).clamp_min(1e-6))
+
+            # label shape 對齊
+            if label.dim() == 4 and label.size(1) == 1:
+                label_ce = label.squeeze(1)
+            else:
+                label_ce = label
+
+            v_loss_dice = dice_loss(val_out, label_ce, softmax=False)
+            val_dice = 1.0 - float(v_loss_dice.item())
+            val_dice_sum += val_dice
+            n += 1
+
+    print("Trainer-style mean dice:", val_dice_sum / max(n, 1))
+
+
 
 
 if __name__ == "__main__":
@@ -92,11 +197,11 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-
+    '''
     dataset_config = {
         'Synapse': {
             'Dataset': Synapse_dataset,
-            'volume_path': '../data/Synapse/test_vol_h5',
+            'volume_path': '../data/Synapse/test_npz',  # ← 重點
             'list_dir': './lists/lists_Synapse',
             'num_classes': 9,
             'z_spacing': 1,
@@ -109,7 +214,9 @@ if __name__ == "__main__":
     args.list_dir = dataset_config[dataset_name]['list_dir']
     args.z_spacing = dataset_config[dataset_name]['z_spacing']
     args.is_pretrain = True
-
+    '''
+    dataset_name = args.dataset
+    args.is_pretrain = True
     # name the same snapshot defined in train script!
     args.exp = 'TU_' + dataset_name + str(args.img_size)
     snapshot_path = "../model/{}/{}".format(args.exp, 'TU')
@@ -155,7 +262,7 @@ if __name__ == "__main__":
     # 去掉 module. 前綴（如果有 DataParallel）
     new_ckpt = { (k[7:] if k.startswith("module.") else k): v for k, v in ckpt.items() }
 
-    ret = net.load_state_dict(new_ckpt, strict=False)
+    ret = net.load_state_dict(new_ckpt, strict=True)
     print("Loaded:", snapshot)
     print("Missing:", len(ret.missing_keys), "Unexpected:", len(ret.unexpected_keys))
     print("Missing sample:", ret.missing_keys[:20])

@@ -554,7 +554,7 @@ class TransUNet_TransformerDecoder(nn.Module):
         self.class_head = nn.Linear(self.hidden_size, num_classes)
         self.mask_projector = nn.Linear(self.hidden_size, self.hidden_size) # 用於計算 Mask
         #nn.init.constant_(self.mask_projector.bias, 2.0)
-        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * 2.0)
+        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * (-2.0))
     def forward(self, x):
         # 1. 處理輸入 (若是灰階圖轉為 RGB)
         if x.size(1) == 1:
@@ -587,9 +587,9 @@ class TransUNet_TransformerDecoder(nn.Module):
         # 3. 初始 Mask (Z^0) - 使用投影後的高解析特徵 F 計算
         scale = self.hidden_size ** 0.5  # sqrt(768) ≈ 27.7
         logits = torch.bmm(queries, F_sequence.transpose(1, 2)) / scale
-        logits = torch.tanh(logits / 3.0) * 3.0
+        #logits = torch.tanh(logits / 3.0) * 3.0
         logits = logits + self.mask_logit_bias
-        #logits = torch.clamp(logits, -10, 10) 
+        logits = torch.clamp(logits, -6, 6) 
         current_mask = torch.sigmoid(logits) # (B, Q, L)
 
         refined_masks = []
@@ -602,9 +602,9 @@ class TransUNet_TransformerDecoder(nn.Module):
             # 更新 Mask
             mask_embed = self.mask_projector(queries)
             logits = torch.bmm(mask_embed, F_sequence.transpose(1, 2)) / scale
-            logits = torch.tanh(logits / 3.0) * 3.0
+            #logits = torch.tanh(logits / 3.0) * 3.0
             logits = logits + self.mask_logit_bias
-            #logits = torch.clamp(logits, -10, 10)
+            logits = torch.clamp(logits, -6, 6)
             current_mask = torch.sigmoid(logits)
             
             # Reshape 回空間維度 (B, Q, H, W)
@@ -628,6 +628,7 @@ class TransUNet_TransformerDecoder(nn.Module):
             # 3. 矩陣運算組合: 每個 Pixel 的類別 = 所有 Query 的加權總和
             # einsum: "bqc, bqhw -> bchw"
             semantic_segmentation = torch.einsum("bqc, bqhw -> bchw", class_probs, mask_probs)
+            semantic_segmentation = torch.softmax(semantic_segmentation, dim=1)
             '''
             print("FORWARD DEBUG semantic pre-clamp min/max/mean:",
                 float(semantic_segmentation.min().item()),
@@ -643,7 +644,7 @@ class TransUNet_TransformerDecoder(nn.Module):
                 float(class_probs.mean().item()))
             '''
 
-            semantic_segmentation = torch.clamp(semantic_segmentation, min=1e-7, max=1-1e-7)
+            #semantic_segmentation = torch.clamp(semantic_segmentation, min=1e-7, max=1-1e-7)
             # 使用雙線性插值 (Bilinear) 恢復成 input_size (512x512)
             semantic_segmentation = F.interpolate(
                 semantic_segmentation, 

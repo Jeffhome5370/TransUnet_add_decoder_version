@@ -46,41 +46,50 @@ class RandomGenerator(object):
         return sample
 
 
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
 class Synapse_dataset(Dataset):
     def __init__(self, base_dir, list_dir, split, transform=None):
-        self.transform = transform  # using transform in torch!
+        """
+        base_dir: 存放 .npz 的資料夾
+        list_dir: 存放 train.txt / val.txt / test.txt
+        split: 'train' | 'val' | 'test'
+        transform: optional torch-style transform
+        """
+        self.transform = transform
         self.split = split
-        self.sample_list = open(os.path.join(list_dir, self.split+'.txt')).readlines()
         self.data_dir = base_dir
+
+        list_path = os.path.join(list_dir, split + ".txt")
+        with open(list_path, "r") as f:
+            self.sample_list = [line.strip() for line in f]
 
     def __len__(self):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        if "train" in self.split or "val" in self.split:
-            slice_name = self.sample_list[idx].strip('\n')
-            data_path = os.path.join(self.data_dir, slice_name+'.npz')
-            data = np.load(data_path)
-            image, label = data['image'], data['label']
-        else:
-            vol_name = self.sample_list[idx].strip('\n')
-            filepath = self.data_dir + "/{}.npy.h5".format(vol_name)
-            data = h5py.File(filepath)
-            image, label = data['image'][:], data['label'][:]
+        slice_name = self.sample_list[idx]
+        data_path = os.path.join(self.data_dir, slice_name + ".npz")
 
-        sample = {'image': image, 'label': label}
-        if self.transform:
+        data = np.load(data_path)
+        image = data["image"]      # (H, W)
+        label = data["label"]      # (H, W)
+
+        sample = {"image": image, "label": label}
+
+        if self.transform is not None:
             sample = self.transform(sample)
         else:
-            image = sample['image']
-            label = sample['label']
-            
-            # 1. 轉成 Tensor 並增加 Channel 維度: (H, W) -> (1, H, W)
+            # image: (H, W) -> (1, H, W)
             image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
-            
-            # 2. Label 轉成 LongTensor (不需增加維度)
-            label = torch.from_numpy(label.astype(np.float32)).long()
-            
-            sample = {'image': image, 'label': label}
-        sample['case_name'] = self.sample_list[idx].strip('\n')
+            # label: (H, W), class index
+            label = torch.from_numpy(label.astype(np.int64))
+
+            sample = {"image": image, "label": label}
+
+        # 保留 slice 名稱，對 debug / 存檔很有用
+        sample["case_name"] = slice_name
         return sample

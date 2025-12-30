@@ -20,38 +20,40 @@ class DiceLoss(nn.Module):
         return output_tensor.float()
 
     def _dice_loss(self, score, target):
-        target = target.float()
         smooth = 1e-5
-        intersect = torch.sum(score * target)
-        y_sum = torch.sum(target * target)
-        z_sum = torch.sum(score * score)
-        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
-        loss = 1 - loss
-        return loss
+        score = score.float()
+        target = target.float()
+        dims = (1, 2)  # H,W
+
+        intersect = (score * target).sum(dims)   # (B,)
+        y_sum = (target * target).sum(dims)      # (B,)
+        z_sum = (score * score).sum(dims)        # (B,)
+
+        dice = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        return (1 - dice).mean()
 
     def forward(self, inputs, target, weight=None, softmax=False):
         if softmax:
             inputs = torch.softmax(inputs, dim=1)
 
-        if target.shape == inputs.shape:
-            pass # 什麼都不做，直接用
-        else:
-            # 只有當形狀不一樣時 (例如 target 是單層索引)，才做 One-Hot
-            if target.dim() == 4 and target.shape[1] == 1:
+        if target.shape != inputs.shape:
+            if target.dim() == 4 and target.size(1) == 1:
                 target = target.squeeze(1)
             target = self._one_hot_encoder(target)
 
-        if weight is None:
-            weight = [1] * self.n_classes
-        assert inputs.size() == target.size(), 'predict {} & target {} shape do not match'.format(inputs.size(), target.size())
-        class_wise_dice = []
+        assert inputs.size() == target.size(), f"predict {inputs.size()} & target {target.size()} mismatch"
+
         loss = 0.0
-        target = target.float()
-        for i in range(1, self.n_classes):# skip background
-            dice = self._dice_loss(inputs[:, i], target[:, i])
-            class_wise_dice.append(1.0 - dice.item())
-            loss += dice * weight[i]
-        return loss / (self.n_classes-1)
+        cnt = 0
+        for i in range(1, self.n_classes):  # skip background
+            if target[:, i].sum().item() == 0:
+                continue
+            loss = loss + self._dice_loss(inputs[:, i], target[:, i])
+            cnt += 1
+
+        if cnt == 0:
+            return inputs.sum() * 0.0
+        return loss / cnt
 
 
 def calculate_metric_percase(pred, gt):
@@ -92,7 +94,14 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
                 
             # 4. [關鍵修正] 轉為 Tensor 並確保是 4D: (1, 1, H, W)
             input = torch.from_numpy(slice).float().cuda()
-            
+
+            #--------------------------------------------------
+            if ind == 0:
+                print("DEBUG raw slice min/max/mean/std:",
+                    float(slice.min()), float(slice.max()),
+                    float(slice.mean()), float(slice.std()))
+            #--------------------------------------------------
+
             # 如果是 2D (H, W)，加兩個維度 -> (1, 1, H, W)
             if len(input.shape) == 2:
                 input = input.unsqueeze(0).unsqueeze(0)

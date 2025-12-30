@@ -73,7 +73,7 @@ def trainer_synapse(args, model, snapshot_path):
     print("--------------------------------------------------------------")
 
     best_performance = 0.0 # 用來記錄最佳 Dice
-    iterator = tqdm(range(max_epoch+1), ncols=70)
+    iterator = tqdm(range(max_epoch), ncols=70)
     
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
@@ -120,6 +120,10 @@ def trainer_synapse(args, model, snapshot_path):
             else:
                 label_ce = label_batch
             
+            bg_keep_prob = 0.2
+            if (label_ce > 0).sum() == 0:
+                if torch.rand(1, device=label_ce.device).item() > bg_keep_prob:
+                    continue
             class_logits, masks = model(image_batch)     # class_logits: (B,Q,C), masks: list[(B,Q,h,w)]
             # 新模型的輸出是 (class_logits, refined_masks_list)
             # 我們取出最後一層的 Mask 預測
@@ -127,36 +131,128 @@ def trainer_synapse(args, model, snapshot_path):
             mask_logits = masks[-1]                      # (B,Q,h,w)
             
             
-            # 執行上採樣 (Upsampling) 到圖片原始大小 (例如 224x224)
-            # 因為 Transformer Decoder 在 Patch Level 運作
-            mask_logits = F.interpolate(mask_logits, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
-            
-            mask_probs  = torch.sigmoid(mask_logits)     # (B,Q,H,W)  (mask 用 sigmoid)
-            class_probs = torch.softmax(class_logits, dim=-1)  # (B,Q,C) (class 用 softmax)
-            semantic_prob = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
-            semantic_prob = semantic_prob + 1e-7  # 用加法，不用 clamp
-            semantic_prob_norm = semantic_prob / (
-                semantic_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
-            )
+            # mask_logits -> mask_probs
+            mask_logits = F.interpolate(masks[-1], size=(args.img_size, args.img_size),
+                                        mode='bilinear', align_corners=False)
+            mask_probs = torch.sigmoid(mask_logits)  # (B,Q,H,W)
 
-            #-----------檢查每個 pixel 的 9 類加起來平均是多少---------------------------------------
+            # 1) 用 logits 組 semantic_logits（不要先 softmax class_logits）
+            # class_logits: (B,Q,C)
+            semantic_logits = torch.einsum(
+                "bqc,bqhw->bchw",
+                class_logits,
+                mask_probs
+            )  # (B,C,H,W)
+
+            den = mask_probs.sum(dim=1).clamp_min(1e-6)  # (B,H,W)
+            semantic_logits = semantic_logits / den.unsqueeze(1)
+
+            # ======================================================
+            # Losses
+            # ======================================================
+
+            # ---- Cross Entropy（保守穩定權重）----
+            ce_map = F.cross_entropy(semantic_logits, label_ce, reduction='none')  # (B,H,W)
+            fg_w, bg_w = 6.0, 1.0
+            fg_mask = (label_ce > 0)
+            bg_mask = ~fg_mask
+            loss_ce = (ce_map[fg_mask].mean() * fg_w) + (ce_map[bg_mask].mean() * bg_w)
+
+            # ---- Dice ----
+            semantic_prob = torch.softmax(semantic_logits, dim=1)
+            has_fg = (label_ce > 0).any()
+
+            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
+
+            # ---- Total Loss ----
+            has_fg = (label_ce > 0).any()
+
+            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
+
+            loss = loss_ce + loss_dice
+
+            # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 50 == 0:
-                print("DEBUG sum prob mean (raw):", semantic_prob.sum(dim=1).mean().item())
-                print("DEBUG sum prob mean (norm):", semantic_prob_norm.sum(dim=1).mean().item())  # 應≈1
-                print("mask_logits mean/min/max:",
-                    mask_logits.mean().item(), mask_logits.min().item(), mask_logits.max().item())
-                print("mask_probs mean/min/max:",
-                    mask_probs.mean().item(), mask_probs.min().item(), mask_probs.max().item())
-                print("class_probs mean/min/max:",
-                    class_probs.mean().item(), class_probs.min().item(), class_probs.max().item())
-            #-------------------------------------------------------------------------------------
+                with torch.no_grad():
+                    # -------- 基本張量 --------
+                    prob = semantic_prob                   # (B,C,H,W)
+                    pred = prob.argmax(dim=1)              # (B,H,W)
+                    bg = prob[:, 0]                        # (B,H,W)
+                    fg = prob[:, 1:].max(dim=1).values     # (B,H,W)
 
-            loss_ce = F.nll_loss(torch.log(semantic_prob_norm), label_ce.long())
-            loss_dice = dice_loss(semantic_prob_norm, label_ce, softmax=False)  # 因為已是 prob，不要再 softmax
-            loss = 0.5 * loss_ce + 0.5 * loss_dice
+                    # -------- GT / 前景統計 --------
+                    gt_fg = (label_ce > 0)
+                    gt_fg_ratio = gt_fg.float().mean().item()
+                    pred_fg_ratio = (pred > 0).float().mean().item()
+
+                    # -------- 最重要：logits 尺度（找「softmax太平」根因）--------
+                    # 注意：這裡用 semantic_logits（你前面一定有）
+                    s_logit = semantic_logits
+                    s_mean = float(s_logit.mean().item())
+                    s_min  = float(s_logit.min().item())
+                    s_max  = float(s_logit.max().item())
+                    # 每像素 top1-top2 margin：越大代表分類越「有把握」
+                    top2 = torch.topk(s_logit, k=2, dim=1).values  # (B,2,H,W)
+                    logit_margin = (top2[:, 0] - top2[:, 1])
+                    logit_margin_mean = float(logit_margin.mean().item())
+                    logit_margin_min  = float(logit_margin.min().item())
+                    logit_margin_max  = float(logit_margin.max().item())
+
+                    # -------- mask 相關（找「mask塌陷/全黑」根因）--------
+                    # mask_probs: (B,Q,H,W)
+                    den = mask_probs.sum(dim=1)  # (B,H,W)
+                    den_mean = float(den.mean().item())
+                    den_min  = float(den.min().item())
+                    den_max  = float(den.max().item())
+
+                    # 每個 query 的平均面積分布（看是不是都趨近 0）
+                    area_per_q = mask_probs.mean(dim=(2, 3))  # (B,Q)
+                    area_q_mean = float(area_per_q.mean().item())
+                    area_q_max  = float(area_per_q.max().item())
+                    area_q_min  = float(area_per_q.min().item())
+
+                    # -------- GT 上到底有沒有在學（超關鍵）--------
+                    # GT 前景像素上：p(gt) 應該慢慢變大、p(bg) 應該慢慢變小
+                    if gt_fg.any():
+                        p_gt = prob.gather(1, label_ce.unsqueeze(1)).squeeze(1)   # (B,H,W)
+                        p_gt_fg_mean = float(p_gt[gt_fg].mean().item())
+                        p_bg_fg_mean = float(bg[gt_fg].mean().item())
+                    else:
+                        p_gt_fg_mean = float("nan")
+                        p_bg_fg_mean = float("nan")
+
+                    # -------- 你原本的幾個指標（保留但放後面）--------
+                    prob_sum_mean = float(prob.sum(dim=1).mean().item())  # 應≈1
+                    pred_unique = torch.unique(pred).detach().cpu().tolist()[:20]
+
+                    print("===== DEBUG =====")
+                    print(f"prob_sum_mean: {prob_sum_mean:.4f} (should be ~1)")
+                    print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio: {pred_fg_ratio:.4f}")
+                    print(f"pred_unique: {pred_unique}")
+
+                    print(f"[semantic_logits] mean/min/max: {s_mean:.4f} / {s_min:.4f} / {s_max:.4f}")
+                    print(f"[logit_margin top1-top2] mean/min/max: {logit_margin_mean:.4f} / {logit_margin_min:.4f} / {logit_margin_max:.4f}")
+
+                    print(f"[bg prob] mean/min/max: {float(bg.mean()):.4f} / {float(bg.min()):.4f} / {float(bg.max()):.4f}")
+                    print(f"[fg prob(max over classes)] mean/min/max: {float(fg.mean()):.4f} / {float(fg.min()):.4f} / {float(fg.max()):.4f}")
+
+                    print(f"[mask_logits] mean/min/max: {float(mask_logits.mean()):.4f} / {float(mask_logits.min()):.4f} / {float(mask_logits.max()):.4f}")
+                    print(f"[mask_probs]  mean/min/max: {float(mask_probs.mean()):.4f} / {float(mask_probs.min()):.4f} / {float(mask_probs.max()):.4f}")
+                    print(f"[den=sum_q(mask_probs)] mean/min/max: {den_mean:.4f} / {den_min:.4f} / {den_max:.4f}")
+                    print(f"[area_per_q] mean/min/max: {area_q_mean:.4f} / {area_q_min:.4f} / {area_q_max:.4f}")
+
+                    print(f"loss_ce: {float(loss_ce.item()):.4f}")
+                    print(f"loss_dice: {float(loss_dice.item()):.4f}" if has_fg else "loss_dice: 0.0 (no fg)")
+                    if gt_fg.any():
+                        print(f"[on GT fg pixels] mean p(gt): {p_gt_fg_mean:.4f} | mean p(bg): {p_bg_fg_mean:.4f}")
+                    else:
+                        print("[on GT fg pixels] N/A (no fg in GT)")
+                    print("=================")
+                                    
+            # ==========================================
             optimizer.zero_grad()
             loss.backward()
-            #-----------check grad_norm---------------------------
+            #-----------check grad_norm---------------------    -----
             if iter_num % 50 == 0:
                 total_norm = torch.norm(torch.stack([
                     p.grad.detach().norm(2)
@@ -197,7 +293,7 @@ def trainer_synapse(args, model, snapshot_path):
                 image_show = (image_show - image_show.min()) / (image_show.max() - image_show.min() + 1e-8)
 
                 # 2. 準備預測 Mask (Argmax 轉成 0-8 的整數)
-                pred_mask = semantic_prob_norm.argmax(dim=1)[0].cpu().numpy()
+                pred_mask = semantic_prob.argmax(dim=1)[0].detach().cpu().numpy()
                 
                 # 3. 準備 Ground Truth Mask
                 gt_mask = label_ce[0].cpu().numpy()
@@ -221,71 +317,84 @@ def trainer_synapse(args, model, snapshot_path):
                 })
                 writer.add_image('train/Image', image_show[None, ...], iter_num)
 
-
-
-
-
-
-
-
-
-
-
         # ================================
         #       Validation Stage
         # ================================
-        if (epoch_num % 5 == 0): 
+        if (epoch_num % 5 == 0):
             model.eval()
-            val_dice_sum = 0.0
-            num_val_batches = 0
-            
-            # 使用 tqdm 顯示驗證進度
-            with torch.no_grad():
-                for i_val, val_batch in tqdm(enumerate(valloader), total=len(valloader), desc=f"Validating Epoch {epoch_num}"):
-                    val_img, val_label = val_batch['image'].cuda(), val_batch['label'].cuda()
 
+            dice_per_class = {c: [] for c in range(1, args.num_classes)}
+            dice_per_slice = []  # 每張 slice 的平均 dice（只平均該 slice 有 GT 的器官）
+
+            with torch.no_grad():
+                for _, val_batch in tqdm(enumerate(valloader), total=len(valloader),
+                                        desc=f"Validating Epoch {epoch_num}"):
+
+                    val_img = val_batch['image'].cuda()
+                    val_label = val_batch['label'].cuda()
+
+                    # ---- label 統一成 (B,H,W) 的 long ----
                     if val_label.dim() == 4 and val_label.size(1) == 1:
                         val_label_ce = val_label.squeeze(1)
                     elif val_label.dim() == 3:
                         val_label_ce = val_label
-                    elif val_label.dim() == 5:  # 你原本的保險
+                    elif val_label.dim() == 5:
                         val_label_ce = val_label.squeeze(2)
                         if val_label_ce.dim() == 4 and val_label_ce.size(1) == 1:
                             val_label_ce = val_label_ce.squeeze(1)
                     else:
                         val_label_ce = val_label
-                    
-                    # --- Validation Forward ---
+                    val_label_ce = val_label_ce.long()  # ✅ 確保 long
+
+                    # ---- forward：拿到 (B,C,H,W) 機率 ----
                     if args.add_decoder:
-                        _, val_out = model(val_img)
+                        _, val_out = model(val_img)  # 你模型 eval 會回 (None, prob)
                         val_out = val_out + 1e-7
                         val_out = val_out / (val_out.sum(dim=1, keepdim=True).clamp_min(1e-6))
-                        #val_out = F.interpolate(val_out, size=(args.img_size, args.img_size), mode='bilinear', align_corners=False)
                     else:
                         val_out = model(val_img)
+                        # 如果原版輸出 logits，這裡要 softmax
+                        val_out = torch.softmax(val_out, dim=1)
 
                     if val_out.dim() == 3:
-                        val_out = val_out.unsqueeze(0) # (9, 512, 512) -> (1, 9, 512, 512)
+                        val_out = val_out.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
 
-                    # 雙重保險：如果 val_label 少了 Batch 維度，也補回去
-                    if val_label.dim() == 3:
-                        val_label = val_label.unsqueeze(0)
+                    pred = val_out.argmax(dim=1)  # (B,H,W)
 
-                    if val_label.dim() == 5:
-                        val_label = val_label.squeeze(2)
-                    # --- 計算 Dice Score ---
-                    # 這裡為了效率，直接利用 DiceLoss 計算 (Dice = 1 - DiceLoss)
-                    # 這樣可以快速得到 Batch 平均 Dice，不用做複雜的 Metric 計算
-                    loss_ce = F.nll_loss(torch.log(val_out), val_label_ce.long())
-                    v_loss_dice = dice_loss(val_out, val_label_ce, softmax=False)
-                    val_dice = 1.0 - float(v_loss_dice.item())
-                    val_dice_sum += val_dice
-                    num_val_batches += 1
-            
-            # 計算平均 Dice
-            avg_val_dice = val_dice_sum / num_val_batches if num_val_batches > 0 else 0.0
+                    # ---- 計算 per-slice dice（只平均該 slice 有 GT 的 class）----
+                    dices_this_slice = []
+                    for cls in range(1, args.num_classes):
+                        gt = (val_label_ce == cls)
+                        if gt.sum() == 0:
+                            continue
+                        pd = (pred == cls)
+                        inter = (gt & pd).sum().float()
+                        dice = (2 * inter) / (gt.sum() + pd.sum() + 1e-5)
+
+                        dice_per_class[cls].append(dice.item())
+                        dices_this_slice.append(dice.item())
+
+                    if len(dices_this_slice) > 0:
+                        dice_per_slice.append(sum(dices_this_slice) / len(dices_this_slice))
+
+            # ---- 匯總：per-class + overall mean（不灌水）----
+            print("===== Validation Per-class Dice =====")
+            class_mean = {}
+            for cls, dices in dice_per_class.items():
+                if len(dices) == 0:
+                    print(f"class {cls}: N/A (n=0)")
+                    class_mean[cls] = None
+                else:
+                    m = float(np.mean(dices))
+                    print(f"class {cls}: {m:.4f} (n={len(dices)})")
+                    class_mean[cls] = m
+
+            avg_val_dice = float(np.mean(dice_per_slice)) if len(dice_per_slice) > 0 else 0.0
+            print(f"===== Validation mean dice (slice-level, GT-only) = {avg_val_dice:.6f} =====")
+
             wandb.log({
-                "val/mean_dice": avg_val_dice,
+                "val/mean_dice_gt_only": avg_val_dice,
+                **{f"val/dice_class_{cls}": (m if m is not None else 0.0) for cls, m in class_mean.items()},
                 "epoch": epoch_num
             })
             writer.add_scalar('info/val_dice', avg_val_dice, epoch_num)
@@ -311,18 +420,18 @@ def trainer_synapse(args, model, snapshot_path):
                 logging.info(f"Early stopping triggered at epoch {epoch_num}")
                 break
 
-        save_interval = 50  # int(max_epoch/6)
-        if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
-            save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
-            torch.save(model.state_dict(), save_mode_path)
-            logging.info("save model to {}".format(save_mode_path))
-
         if epoch_num >= max_epoch - 1:
             save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
             torch.save(model.state_dict(), save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
             iterator.close()
             break
+
+        if (epoch_num % 50 == 0):
+            save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+            
     
     writer.close()
     return "Training Finished!"
