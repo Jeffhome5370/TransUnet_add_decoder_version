@@ -169,7 +169,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ---- Cross Entropy（保守穩定權重）----
             label_ce = label_ce.long()
 
-            weights = torch.tensor([0.3, 1.2068, 2.3783, 1.0005, 0.9995, 0.3031, 1.4043, 0.6388, 0.6094],
+            weights = torch.tensor([0.3, 1.5, 3.0, 1.0, 1.2, 0.35, 1.8, 0.9, 0.9],
                                 device=semantic_logits.device)
 
             # per-pixel CE (no reduction)
@@ -210,13 +210,21 @@ def trainer_synapse(args, model, snapshot_path):
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
             
             # ----fix Loss ratio----
-            pred_fg_ratio = (semantic_prob.argmax(1) > 0).float().mean().item()
+            pred_fg_ratio = (semantic_prob.argmax(1) > 0).float().mean().item() #模型目前「把多少比例的像素預測成前景（非背景）」。
 
-            if pred_fg_ratio < 0.002:       # <0.2%
+            prob = semantic_prob                   # (B,C,H,W)
+            bg = prob[:, 0]                        # (B,H,W)
+            
+            if gt_fg.any():
+                p_bg_on_fg = bg[gt_fg].mean().item()
+            else:
+                p_bg_on_fg = 1.0
+
+            if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.8:       # <0.2%
                 lambda_dice = 4.0
-            elif pred_fg_ratio < 0.01:      # <1%
+            elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.6:      # <1%
                 lambda_dice = 3.0
-            elif pred_fg_ratio < 0.05:      # <5%
+            elif pred_fg_ratio < 0.05 or p_bg_on_fg > 0.4:      # <5%
                 lambda_dice = 2.0
             else:
                 lambda_dice = 1.0
@@ -330,11 +338,19 @@ def trainer_synapse(args, model, snapshot_path):
                 "train/loss_ce": loss_ce.item(),
                 "train/loss_dice": loss_dice.item(),
                 "train/lr": lr_,
-                "epoch": epoch_num
+                "epoch": epoch_num,
+                "train/pred_fg_ratio": pred_fg_ratio,
+                "train/p_bg_on_fg": p_bg_on_fg,
+                "train/lambda_dice": lambda_dice,
             })
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
+            writer.add_scalar('info/pred_fg_ratio', pred_fg_ratio, iter_num)
+            writer.add_scalar('info/p_bg_on_fg', p_bg_on_fg, iter_num)
+            writer.add_scalar('info/lambda_dice', lambda_dice, iter_num)
+
+
 
             logging.info('iteration %d : loss : %f, loss_ce: %f' % (iter_num, loss.item(), loss_ce.item()))
             # --- [WandB] 視覺化圖片 (每 50 個 Iteration) ---
