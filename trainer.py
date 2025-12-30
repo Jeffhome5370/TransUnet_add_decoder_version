@@ -395,6 +395,7 @@ def trainer_synapse(args, model, snapshot_path):
             num_fg = int(fg.sum().item())
             # --- FG indices ---
             gt_fg = (label_ce > 0)
+            gt_bg = (label_ce == 0)
             fg_idx = gt_fg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
 
             # --- BG hard negatives: pick highest p_fg_any on GT_bg ---
