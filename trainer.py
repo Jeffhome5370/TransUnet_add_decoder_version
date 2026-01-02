@@ -452,18 +452,17 @@ def trainer_synapse(args, model, snapshot_path):
                     # Helpful health stats
                     print(f"[den_raw] mean/min/max: {float(den_raw.mean().item()):.4f} / {float(den_raw.min().item()):.4f} / {float(den_raw.max().item()):.4f}")
                     print(f"[mask_probs] mean/min/max: {float(mask_probs.mean().item()):.4f} / {float(mask_probs.min().item()):.4f} / {float(mask_probs.max().item()):.4f}")
-                    
-                    #-----------check grad_norm--------------------------
-                    total_norm = torch.norm(torch.stack([
-                        p.grad.detach().norm(2)
-                        for p in trainable_params
-                        if p.grad is not None
-                    ]), 2).item()
-                    print("DEBUG grad_norm (before clip):", total_norm)
                     print("=============================")
             # ======================================================
             optimizer.zero_grad()
-            loss.backward()  
+            loss.backward()
+            if iter % 100 == 0:
+                total_norm = torch.norm(torch.stack([
+                    p.grad.detach().norm(2)
+                    for p in trainable_params
+                    if p.grad is not None
+                ]), 2).item()
+                print("DEBUG grad_norm (before clip):", total_norm)
             #-----------------------------------------------------
             torch.nn.utils.clip_grad_norm_(
                 trainable_params,   # 或 model.parameters()
