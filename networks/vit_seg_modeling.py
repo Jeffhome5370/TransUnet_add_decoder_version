@@ -554,7 +554,7 @@ class TransUNet_TransformerDecoder(nn.Module):
         self.class_head = nn.Linear(self.hidden_size, num_classes)
         self.mask_projector = nn.Linear(self.hidden_size, self.hidden_size) # 用於計算 Mask
         #nn.init.constant_(self.mask_projector.bias, 2.0)
-        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * (-1.0))
+        self.mask_logit_bias = nn.Parameter(torch.ones(1, num_queries, 1) * (-0.5))
     def forward(self, x):
         # 1. 處理輸入 (若是灰階圖轉為 RGB)
         if x.size(1) == 1:
