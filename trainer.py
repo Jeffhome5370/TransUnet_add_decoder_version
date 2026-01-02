@@ -364,23 +364,47 @@ def trainer_synapse(args, model, snapshot_path):
             den_raw = mask_probs.sum(dim=1)  # (B,H,W) 真的 coverage
             den = den_raw.clamp_min(0.2)    # 用於除法的安全版
             semantic_logits = semantic_logits / den.unsqueeze(1)
-            semantic_logits[:, 1:] += 0.2
+            #semantic_logits[:, 1:] += 0.2
 
-            # semantic_logits: (B, C, H, W)
-            #---------------check模型是否知道哪裡是前景---------------
-            bg_logit = semantic_logits[:, 0:1]  # (B,1,H,W)
-            # 前景集合：只要有任何一個前景類別強，這裡就會強
-            fg_logit = semantic_logits[:, 1:].logsumexp(dim=1, keepdim=True)  # (B,1,H,W)
-            is_fg = (fg_logit > bg_logit)  # (B,1,H,W) bool
-
-            pred_fg_ratio_stage1 = is_fg.float().mean().item()
-            print("Stage1 fg ratio:", pred_fg_ratio_stage1)
-            #------------------------------------------------------
-            
             # ======================================================
             # Losses
             # ======================================================
+            label_ce = label_ce.long()
+            # ---------- Stage 1: FG vs BG ----------
+            bg_logit = semantic_logits[:, 0:1]                      # (B,1,H,W)
+            fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
 
+            # GT 是否為前景
+            gt_is_fg = (label_ce > 0).float().unsqueeze(1)          # (B,1,H,W)
+
+            # binary logit：fg > bg
+            fb_logit = fg_logit - bg_logit                          
+
+            loss_fg_bg = F.binary_cross_entropy_with_logits(
+                fb_logit,
+                gt_is_fg
+            )
+           
+            # ---------- Stage 2: FG class (only on GT FG pixels) ----------
+            fg_mask = (label_ce > 0)             # (B,H,W)
+
+            loss_fg_cls = torch.tensor(0.0, device=semantic_logits.device)
+
+            if fg_mask.any():
+                fg_logits = semantic_logits[:, 1:]                  # (B,C_fg,H,W)
+                loss_fg_cls = F.cross_entropy(
+                    fg_logits.permute(0,2,3,1)[fg_mask],             # (N_fg, C_fg)
+                    (label_ce[fg_mask] - 1).long()                   # class index from 0
+                )
+            
+            #--------------Step 3：Dice 只輔助前景（保留，但弱化--------------
+            semantic_prob = torch.softmax(semantic_logits, dim=1)
+
+            has_fg = fg_mask.any()
+            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else \
+                        torch.tensor(0.0, device=semantic_logits.device)
+            
+            #-------------------------------------------------------------
             # coverage regularization：希望 den_raw 不要太常 < 0.3
             loss_den = F.relu(0.3 - den_raw).pow(2).mean()
             
@@ -388,244 +412,58 @@ def trainer_synapse(args, model, snapshot_path):
             area = mask_probs.mean(dim=(2,3))           # (B,Q)
             max_area = 0.22 
             area_pen = torch.relu(area - max_area).pow(2).mean()   # scalar
-            
-
-            # ---- Cross Entropy（保守穩定權重）----
-            label_ce = label_ce.long()
-
-            weights = torch.tensor([0.3, 1.5, 3.0, 1.0, 1.2, 0.35, 1.8, 0.9, 0.9],
-                                device=semantic_logits.device)
-
-            # per-pixel CE (no reduction)
-            semantic_prob = torch.softmax(semantic_logits, dim=1)
-            ce_map = F.cross_entropy(semantic_logits, label_ce, weight=weights, reduction="none")  # (B,H,W)
-            ce_flat = ce_map.flatten()
-            fg = (label_ce > 0)
-            bg = ~fg
-            #CE 對所有 GT 前景像素都算，但對 GT 背景像素，只挑「最像前景的那一小撮」來算。
-            p_fg_any = semantic_prob[:, 1:].sum(1)
-            num_fg = int(fg.sum().item())
-            # --- FG indices ---
-            gt_fg = (label_ce > 0)
-            gt_bg = (label_ce == 0)
-            fg_idx = gt_fg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
-
-            # --- BG hard negatives: pick highest p_fg_any on GT_bg ---
-            bg_idx = gt_bg.flatten().nonzero(as_tuple=False).squeeze(1)  # (N_bg,)
-
-            if bg_idx.numel() > 0:
-                pfg_flat = p_fg_any.flatten()[bg_idx]                    # (N_bg,)
-                num_bg = min(bg_idx.numel(), 8192)                       # 固定上限，不綁 N_fg
-                if num_bg > 0:
-                    topk = torch.topk(pfg_flat, k=num_bg, largest=True).indices
-                    bg_sel = bg_idx[topk]
-                else:
-                    bg_sel = bg_idx
-            else:
-                bg_sel = bg_idx  # empty
-
-            # --- CE loss combine ---
-            if fg_idx.numel() > 0:
-                loss_ce = ce_flat[fg_idx].mean() + ce_flat[bg_sel].mean()
-            else:
-                # 沒前景：只用 hard-negative bg
-                loss_ce = ce_flat[bg_sel].mean()
-
-            area_per_q = mask_probs.mean(dim=(2, 3))
             overlap_pen = torch.relu(den_raw - 2.0).pow(2).mean()
-            # ---- Dice ----
-            #semantic_prob = torch.softmax(semantic_logits, dim=1)
-            has_fg = (label_ce > 0).any()
+            #--------------------------------------------------------------------
 
-            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
-            #GT 說是背景的像素上，你的前景機率越高，我就越罰你。
-            gt_bg = (label_ce == 0)
-                
-            p_bg = semantic_prob[:, 0]  # (B,H,W)
-            loss_fp = (-torch.log(p_bg.clamp_min(1e-6))[gt_bg]).mean()
+            lambda_fb   = 1.0    # 非常重要
+            lambda_cls  = 1.0
+            lambda_dice = 0.5
 
-            # ---- Total Loss ----
-            has_fg = (label_ce > 0).any()
+            loss = (
+                lambda_fb  * loss_fg_bg +
+                lambda_cls * loss_fg_cls +
+                lambda_dice * loss_dice +
+                1e-3 * loss_den +
+                3e-3 * area_pen +
+                3e-3 * overlap_pen
+            )
 
-            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else torch.tensor(0.0, device=semantic_logits.device)
-            
-            # ----fix Loss ratio----
-            pred_fg_ratio = (semantic_prob.argmax(1) > 0).float().mean().item() #模型目前「把多少比例的像素預測成前景（非背景）」。
-
-            prob = semantic_prob                   # (B,C,H,W)
-            bg = prob[:, 0]                        # (B,H,W)
-            gt_fg = (label_ce > 0)
-
-            if gt_fg.any():
-                p_bg_on_fg = bg[gt_fg].mean().item()
-            else:
-                p_bg_on_fg = 1.0
-
-            gt_fg = (label_ce > 0)
-            gt_fg_ratio = gt_fg.float().mean().item()
-            ratio_mult = pred_fg_ratio / (gt_fg_ratio + 1e-8)
-            
-            # 最高優先：argmax 已經全背景 → 不能再讓 Dice 主導
-            if pred_fg_ratio == 0.0:
-                lambda_dice = 0.5 
-            # 亂噴前景就壓 Dice（不分 gt_fg_ratio）
-            elif ratio_mult > 3.0:
-                lambda_dice = 0.2
-
-            else:
-                # (2) GT 很少：Dice 只做輕微扶正
-                if gt_fg_ratio < 0.01:
-                    if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.90:
-                        lambda_dice = 0.5   # 甚至可以 0.3~0.5
-                    else:
-                        lambda_dice = 0.2   # 更保守，避免噪音擴散
-
-                # (3) GT 足夠：才讓 Dice 去救全背景偷懶
-                else:
-                    if pred_fg_ratio < 0.002 or p_bg_on_fg > 0.80:
-                        lambda_dice = 4.0
-                    elif pred_fg_ratio < 0.01 or p_bg_on_fg > 0.60:
-                        lambda_dice = 3.0
-                    else:
-                        lambda_dice = 2.0
-            
-            lambda_fp = 0.1
-            if pred_fg_ratio == 0.0:
-                lambda_fp_eff = 0.0
-            else:
-                lambda_fp_eff = lambda_fp
-
-            loss = loss_ce + lambda_dice * loss_dice
-            loss = loss + 1e-3 * loss_den
-            loss = loss + 3e-3 * area_pen
-            loss = loss + 3e-3 * overlap_pen
-            loss = loss + lambda_fp_eff * loss_fp
-
-            w_ce      = float(loss_ce.item())
-            w_dice    = float((lambda_dice * loss_dice).item())
-            w_den     = float((1e-3 * loss_den).item())
-            w_area    = float((3e-3 * area_pen).item())
-            w_overlap = float((3e-3 * overlap_pen).item())
-            w_fp      = float((lambda_fp_eff * loss_fp).item())
-
-            w_total = w_ce + w_dice + w_den + w_area + w_overlap + w_fp
             # ===== debug（建議改成看更有意義的東西）=====
             if iter_num % 100 == 0:
                 with torch.no_grad():
-                    # -------- 基本張量 --------
-                    prob = semantic_prob                   # (B,C,H,W)
-                    pred = prob.argmax(dim=1)              # (B,H,W)
-                    bg = prob[:, 0]                        # (B,H,W)
-                    fg = prob[:, 1:].max(dim=1).values     # (B,H,W)
+                    # Stage-1 predicted FG ratio (should become reasonable, not necessarily 1.0)
+                    pred_is_fg = (fb_logit > 0).float()                            # fg if fg_logit > bg_logit
+                    pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
 
-                    # -------- GT / 前景統計 --------
-                    gt_fg = (label_ce > 0)
-                    gt_fg_ratio = gt_fg.float().mean().item()
-                    pred_fg_ratio = (pred > 0).float().mean().item()
+                    # Stage-2 final argmax (for monitoring only; don't drive heuristics)
+                    pred = semantic_prob.argmax(dim=1)
+                    pred_fg_ratio = float((pred > 0).float().mean().item())
 
-                    # -------- 最重要：logits 尺度（找「softmax太平」根因）--------
-                    # 注意：這裡用 semantic_logits（你前面一定有）
-                    s_logit = semantic_logits
-                    s_mean = float(s_logit.mean().item())
-                    s_min  = float(s_logit.min().item())
-                    s_max  = float(s_logit.max().item())
-                    # 每像素 top1-top2 margin：越大代表分類越「有把握」
-                    top2 = torch.topk(s_logit, k=2, dim=1).values  # (B,2,H,W)
-                    logit_margin = (top2[:, 0] - top2[:, 1])
-                    logit_margin_mean = float(logit_margin.mean().item())
-                    logit_margin_min  = float(logit_margin.min().item())
-                    logit_margin_max  = float(logit_margin.max().item())
-
-                    
-
-                    # 每個 query 的平均面積分布（看是不是都趨近 0）
-                    area_per_q = mask_probs.mean(dim=(2, 3))  # (B,Q)
-                    area_q_mean = float(area_per_q.mean().item())
-                    area_q_max  = float(area_per_q.max().item())
-                    area_q_min  = float(area_per_q.min().item())
-
-                    # -------- GT 上到底有沒有在學（超關鍵）--------
-                    # GT 前景像素上：p(gt) 應該慢慢變大、p(bg) 應該慢慢變小
-                    if gt_fg.any():
-                        p_gt = prob.gather(1, label_ce.unsqueeze(1)).squeeze(1)   # (B,H,W)
-                        p_gt_fg_mean = float(p_gt[gt_fg].mean().item())
-                        p_bg_fg_mean = float(bg[gt_fg].mean().item())
-                    else:
-                        p_gt_fg_mean = float("nan")
-                        p_bg_fg_mean = float("nan")
-
-                    # -------- 你原本的幾個指標（保留但放後面）--------
-                    prob_sum_mean = float(prob.sum(dim=1).mean().item())  # 應≈1
+                    gt_fg_ratio = float((label_ce > 0).float().mean().item())
                     pred_unique = torch.unique(pred).detach().cpu().tolist()[:20]
 
-                    print("===== DEBUG =====")
-                    print(f"prob_sum_mean: {prob_sum_mean:.4f} (should be ~1)")
-                    print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio: {pred_fg_ratio:.4f}")
+                    print("===== DEBUG (Two-stage) =====")
+                    print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio(argmax): {pred_fg_ratio:.4f} | Stage1_fg_ratio: {pred_fg_ratio_stage1:.4f}")
                     print(f"pred_unique: {pred_unique}")
 
-                    print(f"[semantic_logits] mean/min/max: {s_mean:.4f} / {s_min:.4f} / {s_max:.4f}")
-                    print(f"[logit_margin top1-top2] mean/min/max: {logit_margin_mean:.4f} / {logit_margin_min:.4f} / {logit_margin_max:.4f}")
+                    print(f"[loss] fg_bg: {float(loss_fg_bg.item()):.4f} | fg_cls: {float(loss_fg_cls.item()):.4f} | dice: {float(loss_dice.item()):.4f}")
+                    print(f"[reg] den: {float(loss_den.item()):.6f} | area: {float(area_pen.item()):.6f} | ovlp: {float(overlap_pen.item()):.6f}")
 
-                    print(f"[bg prob] mean/min/max: {float(bg.mean()):.4f} / {float(bg.min()):.4f} / {float(bg.max()):.4f}")
-                    print(f"[fg prob(max over classes)] mean/min/max: {float(fg.mean()):.4f} / {float(fg.min()):.4f} / {float(fg.max()):.4f}")
-
-                    print(f"[mask_logits] mean/min/max: {float(mask_logits.mean()):.4f} / {float(mask_logits.min()):.4f} / {float(mask_logits.max()):.4f}")
-                    print(f"[mask_probs]  mean/min/max: {float(mask_probs.mean()):.4f} / {float(mask_probs.min()):.4f} / {float(mask_probs.max()):.4f}")
-                    print(f"[den_raw] mean/min/max: {den_raw.mean():.4f} / {den_raw.min():.4f} / {den_raw.max():.4f}")
-                    print(f"[den_clamped] mean/min/max: {den.mean():.4f} / {den.min():.4f} / {den.max():.4f}")
-                    # den_raw: (B,H,W)
-                    thr_list = [2, 3, 4, 6]
-                    for t in thr_list:
-                        ratio = (den_raw > t).float().mean().item()
-                        print(f"pixels with den > {t}: {ratio:.4f}")
-                    print(f"[area_per_q] mean/min/max: {area_q_mean:.4f} / {area_q_min:.4f} / {area_q_max:.4f}")
-
-                    print(f"loss_ce: {float(loss_ce.item()):.4f}")
-                    print(f"loss_dice: {float(loss_dice.item()):.4f}" if has_fg else "loss_dice: 0.0 (no fg)")
-                    if gt_fg.any():
-                        print(f"[on GT fg pixels] mean p(gt): {p_gt_fg_mean:.4f} | mean p(bg): {p_bg_fg_mean:.4f}")
-                    else:
-                        print("[on GT fg pixels] N/A (no fg in GT)")
-                    print("[LOSS MIX]")
-                    print(f"  CE       : {w_ce:.4f} ({w_ce/w_total:.1%})")
-                    print(f"  Dice*w   : {w_dice:.4f} ({w_dice/w_total:.1%})  lambda={lambda_dice:.2f}")
-                    print(f"  den*1e-3 : {w_den:.4f} ({w_den/w_total:.1%})")
-                    print(f"  area*3e-3: {w_area:.4f} ({w_area/w_total:.1%})")
-                    print(f"  ovlp*3e-3: {w_overlap:.4f} ({w_overlap/w_total:.1%})")
-                    print(f"  fp*{lambda_fp_eff:.4f}: {w_fp:.4f} ({w_fp/w_total:.1%})")
-                    fp_mean = float(p_fg_any[gt_bg].mean().item())
-                    fp_q95  = float(torch.quantile(p_fg_any[gt_bg], 0.95).item())
-                    print(f"[FP on GT_bg] mean={fp_mean:.4f}, q95={fp_q95:.4f}")
-                    print("=================")
-            if iter_num % 100 == 0:
-                check_health(
-                    iter_num=iter_num,
-                    prob_sum_mean=prob_sum_mean,
-                    gt_fg_ratio=gt_fg_ratio,
-                    pred_fg_ratio=pred_fg_ratio,
-                    pred_unique=pred_unique,
-                    s_min=s_min,
-                    s_max=s_max,
-                    logit_margin_mean=logit_margin_mean,
-                    den_min=den.min().item(),
-                    den_max=den.max().item(),
-                    mask_mean=float(mask_probs.mean().item()),
-                    area_q_min=area_q_min,
-                    area_q_max=area_q_max,
-                    p_gt_fg_mean=(None if not gt_fg.any() else p_gt_fg_mean),
-                    p_bg_fg_mean=(None if not gt_fg.any() else p_bg_fg_mean),
-                )                    
-            # ==========================================
+                    # Helpful health stats
+                    print(f"[den_raw] mean/min/max: {float(den_raw.mean().item()):.4f} / {float(den_raw.min().item()):.4f} / {float(den_raw.max().item()):.4f}")
+                    print(f"[mask_probs] mean/min/max: {float(mask_probs.mean().item()):.4f} / {float(mask_probs.min().item()):.4f} / {float(mask_probs.max().item()):.4f}")
+                    
+                    #-----------check grad_norm--------------------------
+                    total_norm = torch.norm(torch.stack([
+                        p.grad.detach().norm(2)
+                        for p in trainable_params
+                        if p.grad is not None
+                    ]), 2).item()
+                    print("DEBUG grad_norm (before clip):", total_norm)
+                    print("=============================")
+            # ======================================================
             optimizer.zero_grad()
-            loss.backward()
-            #-----------check grad_norm---------------------    -----
-            if iter_num % 50 == 0:
-                total_norm = torch.norm(torch.stack([
-                    p.grad.detach().norm(2)
-                    for p in trainable_params
-                    if p.grad is not None
-                ]), 2).item()
-                print("DEBUG grad_norm (before clip):", total_norm)
+            loss.backward()  
             #-----------------------------------------------------
             torch.nn.utils.clip_grad_norm_(
                 trainable_params,   # 或 model.parameters()
@@ -641,28 +479,44 @@ def trainer_synapse(args, model, snapshot_path):
 
             # --- [WandB] 紀錄訓練數值 ---
             wandb.log({
-                "train/loss": loss.item(),
-                "train/loss_ce": loss_ce.item(),
-                "train/loss_dice": loss_dice.item(),
+                # ----- total -----
+                "train/loss_total": loss.item(),
                 "train/lr": lr_,
                 "epoch": epoch_num,
-                "train/pred_fg_ratio": pred_fg_ratio,
-                "train/p_bg_on_fg": p_bg_on_fg,
-                "train/lambda_dice": lambda_dice,
+
+                # ----- Stage 1: FG vs BG -----
+                "train/loss_fg_bg": loss_fg_bg.item(),
+                "train/stage1_fg_ratio": pred_fg_ratio_stage1,
+
+                # ----- Stage 2: FG class -----
+                "train/loss_fg_cls": loss_fg_cls.item(),
+
+                # ----- Dice (aux) -----
+                "train/loss_dice": loss_dice.item(),
+
+                # ----- Regularization -----
                 "train/loss_den": loss_den.item(),
                 "train/loss_area": area_pen.item(),
-                "train/lambda_dice": lambda_dice,
+                "train/loss_overlap": overlap_pen.item(),
             })
-            writer.add_scalar('info/lr', lr_, iter_num)
-            writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_ce', loss_ce, iter_num)
-            writer.add_scalar('info/pred_fg_ratio', pred_fg_ratio, iter_num)
-            writer.add_scalar('info/p_bg_on_fg', p_bg_on_fg, iter_num)
-            writer.add_scalar('info/lambda_dice', lambda_dice, iter_num)
+            writer.add_scalar("loss/total", loss.item(), iter_num)
+            writer.add_scalar("loss/fg_bg", loss_fg_bg.item(), iter_num)
+            writer.add_scalar("loss/fg_cls", loss_fg_cls.item(), iter_num)
+            writer.add_scalar("loss/dice", loss_dice.item(), iter_num)
+            writer.add_scalar("stat/stage1_fg_ratio", pred_fg_ratio_stage1, iter_num)
+            writer.add_scalar("lr", lr_, iter_num)
 
 
 
-            logging.info('iteration %d : loss : %f, loss_ce: %f' % (iter_num, loss.item(), loss_ce.item()))
+            logging.info(
+                f"iter {iter_num:6d} | "
+                f"loss={loss.item():.4f} | "
+                f"fg_bg={loss_fg_bg.item():.4f} | "
+                f"fg_cls={loss_fg_cls.item():.4f} | "
+                f"dice={loss_dice.item():.4f} | "
+                f"stage1_fg_ratio={pred_fg_ratio_stage1:.4f}"
+            )
+
             # --- [WandB] 視覺化圖片 (每 50 個 Iteration) ---
             if iter_num % 50 == 0:
                 # 1. 準備原圖 (取 batch 第一張, 轉為 numpy, 正規化到 0-1)
