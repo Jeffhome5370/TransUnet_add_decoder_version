@@ -324,7 +324,7 @@ def trainer_synapse(args, model, snapshot_path):
     explore_mode = 1
     den_mean_ema = None
     stage1_fg_ratio_ema = None
-    ema_alpha = 0.9   # 平滑程度（0.9～0.95 都合理）
+    ema_alpha = 0.95   # 平滑程度（0.9～0.95 都合理）
     for epoch_num in iterator:
         model.train()
         
@@ -423,10 +423,6 @@ def trainer_synapse(args, model, snapshot_path):
                         pos_weight=pos_weight
                         
                     )
-            if iter_num % 10 == 0:
-                explore_mode = (stage1_fg_ratio_ema < 0.05)
-                if stage1_fg_ratio_ema > 0.3:
-                    explore_mode = False
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
             with torch.no_grad():
                 # Stage-1 認為是前景
@@ -462,6 +458,12 @@ def trainer_synapse(args, model, snapshot_path):
                 den_mean_ema = ema_alpha * den_mean_ema + (1 - ema_alpha) * den_now
                 stage1_fg_ratio_ema = ema_alpha * stage1_fg_ratio_ema + (1 - ema_alpha) * fg_ratio_now
 
+            if explore_mode:
+                if stage1_fg_ratio_ema > 0.20:
+                    explore_mode = False
+            else:
+                if stage1_fg_ratio_ema < 0.05:
+                    explore_mode = True
 
             #--------------Step 3：Dice 只輔助前景（保留，但弱化--------------
             semantic_prob = torch.softmax(semantic_logits, dim=1)
