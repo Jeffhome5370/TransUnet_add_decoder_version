@@ -499,11 +499,9 @@ def trainer_synapse(args, model, snapshot_path):
                     pred_is_fg = (fb_logit > 0).float()                            # fg if fg_logit > bg_logit
                     pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
                     
-                    explore_mode = (
-                        den_mean_ema < 1.2 or
-                        stage1_fg_ratio_ema < 0.1 or
-                        stage1_fg_ratio_ema < 0.05
-                    )
+                    explore_mode = (stage1_fg_ratio_ema < 0.05)
+                    if stage1_fg_ratio_ema > 0.3:
+                        explore_mode = False
                     pred_is_fg = (fb_logit > 0).squeeze(1)        # (B,H,W) bool
                     gt_is_fg   = (label_ce > 0)
 
