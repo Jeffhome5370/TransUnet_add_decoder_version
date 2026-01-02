@@ -394,6 +394,7 @@ def trainer_synapse(args, model, snapshot_path):
                                   
             if explore_mode:
                 # Phase A：強迫探索（避免全背景）
+                fb_logit = fb_logit + 0.3   # 或 0.2~0.5 之間
                 pos_weight = torch.tensor([5.0], device=fb_logit.device)
             else:
                 # Phase B：回到真實比例（你原本那套）
@@ -653,7 +654,7 @@ def trainer_synapse(args, model, snapshot_path):
         # ================================
         #       Validation Stage
         # ================================
-        if (epoch_num % 1 == 0):
+        if (epoch_num % 2 == 0):
             model.eval()
 
             dice_per_class = {c: [] for c in range(1, args.num_classes)}
