@@ -410,7 +410,7 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 # Stage-1 認為是前景
                 pred_is_fg = (fb_logit > 0).squeeze(1)   # (B,H,W)
-                pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
+                
 
                 # GT 或 Stage-1 認為是前景
                 cls_mask = (label_ce > 0) | pred_is_fg   # (B,H,W)
@@ -427,6 +427,9 @@ def trainer_synapse(args, model, snapshot_path):
             # --------------------------------------------------
             # Update EMA (after computing den_raw & stage1 ratio)
             # --------------------------------------------------
+            with torch.no_grad():
+                    pred_is_fg = (fb_logit > 0).float()                            # fg if fg_logit > bg_logit
+                    pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
             den_now = den_raw.mean().item()
             fg_ratio_now = pred_fg_ratio_stage1
 
