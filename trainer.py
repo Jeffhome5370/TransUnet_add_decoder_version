@@ -329,6 +329,7 @@ def trainer_synapse(args, model, snapshot_path):
         model.train()
         
         for i_batch, sampled_batch in enumerate(trainloader):
+            fg_frac = None
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
 
@@ -573,7 +574,7 @@ def trainer_synapse(args, model, snapshot_path):
             iter_num = iter_num + 1
 
             # --- [WandB] 紀錄訓練數值 ---
-            wandb.log({
+            log_dict = {
                 # -------- losses --------
                 "train/loss": loss.item(),
                 "train/loss_fg_bg": loss_fg_bg.item(),
@@ -581,8 +582,8 @@ def trainer_synapse(args, model, snapshot_path):
                 "train/loss_dice": loss_dice.item(),
 
                 # -------- Stage-1 stats --------
-                "train/fg_frac": fg_frac.item(),
-                "train/pos_weight": pos_weight.item(),
+                #"train/fg_frac": fg_frac.item(),
+                #"train/pos_weight": pos_weight.item(),
                 "train/stage1_fg_ratio": float(pred_is_fg.float().mean().item()),
                 "train/FP_rate": FP_rate,
                 "train/FN_rate": FN_rate,
@@ -591,7 +592,13 @@ def trainer_synapse(args, model, snapshot_path):
                 "train/pred_fg_ratio": float((pred > 0).float().mean().item()),
                 "train/fg_dom_ratio": fg_dom_ratio,
                 "train/fg_dom_cls": fg_dom_cls,
-            })
+            }
+            if fg_frac is not None:
+                log_dict["train/fg_frac"] = fg_frac.item()
+                log_dict["train/pos_weight"] = pos_weight.item()
+
+            wandb.log(log_dict)
+            
             writer.add_scalar("loss/total", loss.item(), iter_num)
             writer.add_scalar("loss/fg_bg", loss_fg_bg.item(), iter_num)
             writer.add_scalar("loss/fg_cls", loss_fg_cls.item(), iter_num)
