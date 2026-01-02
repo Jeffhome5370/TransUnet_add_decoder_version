@@ -456,7 +456,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ======================================================
             optimizer.zero_grad()
             loss.backward()
-            if iter % 100 == 0:
+            if iter_num % 100 == 0:
                 total_norm = torch.norm(torch.stack([
                     p.grad.detach().norm(2)
                     for p in trainable_params
