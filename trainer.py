@@ -400,21 +400,26 @@ def trainer_synapse(args, model, snapshot_path):
                 
             )
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
-            fg_mask = (label_ce > 0)             # (B,H,W)
+            with torch.no_grad():
+                # Stage-1 認為是前景
+                pred_is_fg = (fb_logit > 0).squeeze(1)   # (B,H,W)
+
+                # GT 或 Stage-1 認為是前景
+                cls_mask = (label_ce > 0) | pred_is_fg   # (B,H,W)
 
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits.device)
 
-            if fg_mask.any():
+            if cls_mask.any():
                 fg_logits = semantic_logits[:, 1:]                  # (B,C_fg,H,W)
                 loss_fg_cls = F.cross_entropy(
-                    fg_logits.permute(0,2,3,1)[fg_mask],             # (N_fg, C_fg)
-                    (label_ce[fg_mask] - 1).long()                   # class index from 0
+                    fg_logits.permute(0,2,3,1)[cls_mask],             # (N_fg, C_fg)
+                    (label_ce[cls_mask] - 1).long()                   # class index from 0
                 )
             
             #--------------Step 3：Dice 只輔助前景（保留，但弱化--------------
             semantic_prob = torch.softmax(semantic_logits, dim=1)
 
-            has_fg = fg_mask.any()
+            has_fg = cls_mask.any()
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if has_fg else \
                         torch.tensor(0.0, device=semantic_logits.device)
             
@@ -536,7 +541,7 @@ def trainer_synapse(args, model, snapshot_path):
                 # -------- losses --------
                 "train/loss": loss.item(),
                 "train/loss_fg_bg": loss_fg_bg.item(),
-                "train/loss_fg_cls": loss_fg_cls.item() if fg_mask.any() else 0.0,
+                "train/loss_fg_cls": loss_fg_cls.item() if cls_mask.any() else 0.0,
                 "train/loss_dice": loss_dice.item(),
 
                 # -------- Stage-1 stats --------
@@ -564,7 +569,7 @@ def trainer_synapse(args, model, snapshot_path):
                 f"iter {iter_num:5d} | "
                 f"loss={loss.item():.4f} | "
                 f"fg_bg={loss_fg_bg.item():.4f} | "
-                f"fg_cls={loss_fg_cls.item() if fg_mask.any() else 0.0:.4f} | "
+                f"fg_cls={loss_fg_cls.item() if cls_mask.any() else 0.0:.4f} | "
                 f"dice={loss_dice.item():.4f} | "
                 f"stage1_fg_ratio={pred_is_fg.float().mean().item():.4f} | "
                 f"FP_rate={FP_rate:.4f} | FN_rate={FN_rate:.4f}"
