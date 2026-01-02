@@ -443,9 +443,9 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_fb  * loss_fg_bg +
                 lambda_cls * loss_fg_cls +
                 lambda_dice * loss_dice +
-                1e-3 * loss_den +
-                3e-3 * area_pen +
-                3e-3 * overlap_pen
+                1e-2 * loss_den +
+                1e-3 * area_pen +
+                3e-2 * overlap_pen
             )
 
             # ===== debug（建議改成看更有意義的東西）=====
