@@ -389,7 +389,7 @@ def trainer_synapse(args, model, snapshot_path):
                     padding=3
                 )
             # binary logit：fg > bg
-            fb_logit = (fg_logit - bg_logit)/2
+            fb_logit = (fg_logit - bg_logit)/3
             # ---- 判斷目前是否仍在「探索期」 ----
             gt_is_fg = (label_ce > 0).float().unsqueeze(1)
 
@@ -401,6 +401,7 @@ def trainer_synapse(args, model, snapshot_path):
             loss_fg_bg = torch.tensor(0.0, device=fb_logit.device)     
             if pos_idx.numel() > 0 and neg_idx.numel() > 0:         
                 if explore_mode:
+                    lambda_cls = 0.2
                     # Phase A：強迫探索（避免全背景）
                     neg_fb = fb_flat[neg_idx]
                     k = min(neg_idx.numel(), 10 * pos_idx.numel(), 8192)
@@ -413,6 +414,7 @@ def trainer_synapse(args, model, snapshot_path):
                     )
                 else:
                     # Phase B：回到真實比例（你原本那套）
+                    lambda_cls = 1.0
                     with torch.no_grad():
                         fg_frac = gt_is_fg.mean().clamp_min(1e-3)
                     pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=8.0)
@@ -486,7 +488,7 @@ def trainer_synapse(args, model, snapshot_path):
             #--------------------------------------------------------------------
 
             lambda_fb   = 1.0    # 非常重要
-            lambda_cls  = 1.0
+            #lambda_cls  = 1.0
             lambda_dice = 0.5
 
             loss = (
@@ -494,7 +496,7 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_cls * loss_fg_cls +
                 lambda_dice * loss_dice +
                 1e-2 * loss_den +
-                1e-2 * (-area_pen) +
+                1e-2 * (area_pen) +
                 3e-2 * overlap_pen
             )
 
