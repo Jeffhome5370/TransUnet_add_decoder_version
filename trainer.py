@@ -375,8 +375,14 @@ def trainer_synapse(args, model, snapshot_path):
             fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
 
             # GT 是否為前景
-            gt_is_fg = (label_ce > 0).float().unsqueeze(1)          # (B,1,H,W)
-
+            with torch.no_grad():
+                gt_is_fg = (label_ce > 0).float()
+                gt_is_fg = F.avg_pool2d(
+                    gt_is_fg.unsqueeze(1),
+                    kernel_size=7,
+                    stride=1,
+                    padding=3
+                )
             # binary logit：fg > bg
             fb_logit = (fg_logit - bg_logit)/2                          
 
@@ -452,6 +458,12 @@ def trainer_synapse(args, model, snapshot_path):
                     # Helpful health stats
                     print(f"[den_raw] mean/min/max: {float(den_raw.mean().item()):.4f} / {float(den_raw.min().item()):.4f} / {float(den_raw.max().item()):.4f}")
                     print(f"[mask_probs] mean/min/max: {float(mask_probs.mean().item()):.4f} / {float(mask_probs.min().item()):.4f} / {float(mask_probs.max().item()):.4f}")
+                    print(
+                        f"fb_logit mean/min/max: "
+                        f"{fb_logit.mean().item():.4f} / "
+                        f"{fb_logit.min().item():.4f} / "
+                        f"{fb_logit.max().item():.4f}"
+                    )
                     print("=============================")
             # ======================================================
             optimizer.zero_grad()
