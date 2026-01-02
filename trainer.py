@@ -430,9 +430,10 @@ def trainer_synapse(args, model, snapshot_path):
             
             #限制單一 query 面積過大
             area = mask_probs.mean(dim=(2,3))           # (B,Q)
-            max_area = 0.22 
-            area_pen = torch.relu(area - max_area).pow(2).mean()   # scalar
-            overlap_pen = torch.relu(den_raw - 2.0).pow(2).mean()
+            p = (area / (area.sum(dim=1, keepdim=True) + 1e-6)).clamp_min(1e-6)   # normalize over Q
+            area_entropy = -(p * p.log()).sum(dim=1).mean()  # 越大越分散
+            area_pen = -area_entropy
+            overlap_pen = torch.relu(den_raw - 1.0).pow(2).mean()
             #--------------------------------------------------------------------
 
             lambda_fb   = 1.0    # 非常重要
@@ -444,7 +445,7 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_cls * loss_fg_cls +
                 lambda_dice * loss_dice +
                 1e-2 * loss_den +
-                1e-3 * area_pen +
+                1e-2 * area_pen +
                 3e-2 * overlap_pen
             )
 
