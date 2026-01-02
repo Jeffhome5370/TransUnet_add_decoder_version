@@ -423,9 +423,10 @@ def trainer_synapse(args, model, snapshot_path):
                         pos_weight=pos_weight
                         
                     )
-            explore_mode = (stage1_fg_ratio_ema < 0.05)
-            if stage1_fg_ratio_ema > 0.3:
-                explore_mode = False
+            if iter_num % 10 == 0:
+                explore_mode = (stage1_fg_ratio_ema < 0.05)
+                if stage1_fg_ratio_ema > 0.3:
+                    explore_mode = False
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
             with torch.no_grad():
                 # Stage-1 認為是前景
