@@ -386,11 +386,17 @@ def trainer_synapse(args, model, snapshot_path):
             # binary logit：fg > bg
             fb_logit = (fg_logit - bg_logit)/2                          
 
+            # 計算 batch 內的前景比例（soft target 也可）
+            with torch.no_grad():
+                fg_frac = gt_is_fg.mean().clamp_min(1e-3)   # 避免除 0
+
+            pos_weight = (1.0 - fg_frac) / fg_frac
+
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit,
-                gt_is_fg
+                gt_is_fg,
+                pos_weight=pos_weight
             )
-           
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
             fg_mask = (label_ce > 0)             # (B,H,W)
 
