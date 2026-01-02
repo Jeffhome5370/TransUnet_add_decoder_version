@@ -378,7 +378,7 @@ def trainer_synapse(args, model, snapshot_path):
             gt_is_fg = (label_ce > 0).float().unsqueeze(1)          # (B,1,H,W)
 
             # binary logit：fg > bg
-            fb_logit = fg_logit - bg_logit                          
+            fb_logit = (fg_logit - bg_logit)/2                          
 
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit,
