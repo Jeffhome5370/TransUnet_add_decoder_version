@@ -365,6 +365,17 @@ def trainer_synapse(args, model, snapshot_path):
             den = den_raw.clamp_min(0.2)    # 用於除法的安全版
             semantic_logits = semantic_logits / den.unsqueeze(1)
             semantic_logits[:, 1:] += 0.2
+
+            # semantic_logits: (B, C, H, W)
+            #---------------check模型是否知道哪裡是前景---------------
+            bg_logit = semantic_logits[:, 0:1]  # (B,1,H,W)
+            # 前景集合：只要有任何一個前景類別強，這裡就會強
+            fg_logit = semantic_logits[:, 1:].logsumexp(dim=1, keepdim=True)  # (B,1,H,W)
+            is_fg = (fg_logit > bg_logit)  # (B,1,H,W) bool
+
+            pred_fg_ratio_stage1 = is_fg.float().mean().item()
+            print("Stage1 fg ratio:", pred_fg_ratio_stage1)
+            #------------------------------------------------------
             
             # ======================================================
             # Losses
