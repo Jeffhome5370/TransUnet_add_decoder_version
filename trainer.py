@@ -391,11 +391,13 @@ def trainer_synapse(args, model, snapshot_path):
                 fg_frac = gt_is_fg.mean().clamp_min(1e-3)   # 避免除 0
 
             pos_weight = (1.0 - fg_frac) / fg_frac
+            pos_weight = pos_weight.clamp(max=8.0)
 
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit,
                 gt_is_fg,
                 pos_weight=pos_weight
+                
             )
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
             fg_mask = (label_ce > 0)             # (B,H,W)
@@ -447,13 +449,48 @@ def trainer_synapse(args, model, snapshot_path):
                     pred_is_fg = (fb_logit > 0).float()                            # fg if fg_logit > bg_logit
                     pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
 
+                    pred_is_fg = (fb_logit > 0).squeeze(1)        # (B,H,W) bool
+                    gt_is_fg   = (label_ce > 0)
+
+                    TP = (pred_is_fg & gt_is_fg).sum().item()
+                    FP = (pred_is_fg & (~gt_is_fg)).sum().item()
+                    FN = ((~pred_is_fg) & gt_is_fg).sum().item()
+                    TN = ((~pred_is_fg) & (~gt_is_fg)).sum().item()
+
+                    gt_fg_cnt = gt_is_fg.sum().item()
+                    gt_bg_cnt = (~gt_is_fg).sum().item()
+
+                    FP_rate = FP / max(gt_bg_cnt, 1)
+                    FN_rate = FN / max(gt_fg_cnt, 1)
+
                     # Stage-2 final argmax (for monitoring only; don't drive heuristics)
                     pred = semantic_prob.argmax(dim=1)
+                    num_classes = args.num_classes  # 9
+
+                    fg_pixels = pred[pred > 0]      # (N_fg,)
+                    if fg_pixels.numel() > 0:
+                        hist = torch.bincount(fg_pixels, minlength=num_classes).float()  # (C,)
+                        fg_hist = hist[1:]  # only 1..C-1
+                        fg_class_ratio = (fg_hist / fg_hist.sum().clamp_min(1.0))        # (C-1,)
+
+                        # collapse 指標：最大類別占比
+                        fg_dom_ratio = float(fg_class_ratio.max().item())
+                        fg_dom_cls = int(fg_class_ratio.argmax().item() + 1)  # +1 because class starts at 1
+                    else:
+                        fg_class_ratio = torch.zeros(num_classes - 1, device=pred.device)
+                        fg_dom_ratio = 0.0
+                        fg_dom_cls = -1
+                    print(f"[FG hist] dom_cls={fg_dom_cls}, dom_ratio={fg_dom_ratio:.3f}")
                     pred_fg_ratio = float((pred > 0).float().mean().item())
 
                     gt_fg_ratio = float((label_ce > 0).float().mean().item())
                     pred_unique = torch.unique(pred).detach().cpu().tolist()[:20]
-
+                    fg_pixels = pred[pred > 0]
+                    if fg_pixels.numel() > 0:
+                        hist = torch.bincount(fg_pixels, minlength=num_classes)
+                        fg_class_ratio = (hist / hist.sum()).cpu()
+                    else:
+                        fg_class_ratio = torch.zeros(num_classes)
                     print("===== DEBUG (Two-stage) =====")
                     print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio(argmax): {pred_fg_ratio:.4f} | Stage1_fg_ratio: {pred_fg_ratio_stage1:.4f}")
                     print(f"pred_unique: {pred_unique}")
@@ -496,25 +533,23 @@ def trainer_synapse(args, model, snapshot_path):
 
             # --- [WandB] 紀錄訓練數值 ---
             wandb.log({
-                # ----- total -----
-                "train/loss_total": loss.item(),
-                "train/lr": lr_,
-                "epoch": epoch_num,
-
-                # ----- Stage 1: FG vs BG -----
+                # -------- losses --------
+                "train/loss": loss.item(),
                 "train/loss_fg_bg": loss_fg_bg.item(),
-                "train/stage1_fg_ratio": pred_fg_ratio_stage1,
-
-                # ----- Stage 2: FG class -----
-                "train/loss_fg_cls": loss_fg_cls.item(),
-
-                # ----- Dice (aux) -----
+                "train/loss_fg_cls": loss_fg_cls.item() if fg_mask.any() else 0.0,
                 "train/loss_dice": loss_dice.item(),
 
-                # ----- Regularization -----
-                "train/loss_den": loss_den.item(),
-                "train/loss_area": area_pen.item(),
-                "train/loss_overlap": overlap_pen.item(),
+                # -------- Stage-1 stats --------
+                "train/fg_frac": fg_frac.item(),
+                "train/pos_weight": pos_weight.item(),
+                "train/stage1_fg_ratio": float(pred_is_fg.float().mean().item()),
+                "train/FP_rate": FP_rate,
+                "train/FN_rate": FN_rate,
+
+                # -------- collapse check --------
+                "train/pred_fg_ratio": float((pred > 0).float().mean().item()),
+                "train/fg_dom_ratio": fg_dom_ratio,
+                "train/fg_dom_cls": fg_dom_cls,
             })
             writer.add_scalar("loss/total", loss.item(), iter_num)
             writer.add_scalar("loss/fg_bg", loss_fg_bg.item(), iter_num)
@@ -526,12 +561,13 @@ def trainer_synapse(args, model, snapshot_path):
 
 
             logging.info(
-                f"iter {iter_num:6d} | "
+                f"iter {iter_num:5d} | "
                 f"loss={loss.item():.4f} | "
                 f"fg_bg={loss_fg_bg.item():.4f} | "
-                f"fg_cls={loss_fg_cls.item():.4f} | "
+                f"fg_cls={loss_fg_cls.item() if fg_mask.any() else 0.0:.4f} | "
                 f"dice={loss_dice.item():.4f} | "
-                f"stage1_fg_ratio={pred_fg_ratio_stage1:.4f}"
+                f"stage1_fg_ratio={pred_is_fg.float().mean().item():.4f} | "
+                f"FP_rate={FP_rate:.4f} | FN_rate={FN_rate:.4f}"
             )
 
             # --- [WandB] 視覺化圖片 (每 50 個 Iteration) ---
