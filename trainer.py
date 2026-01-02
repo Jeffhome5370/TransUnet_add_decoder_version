@@ -452,7 +452,8 @@ def trainer_synapse(args, model, snapshot_path):
             
             #-------------------------------------------------------------
             # coverage regularization：希望 den_raw 不要太常 < 0.3
-            loss_den = F.relu(0.3 - den_raw).pow(2).mean()
+            den_target = 0.9 if explore_mode else 0.3   # 探索期逼 den 上來
+            loss_den = F.relu(den_target - den_raw).pow(2).mean()
             
             #限制單一 query 面積過大
             area = mask_probs.mean(dim=(2,3))           # (B,Q)
