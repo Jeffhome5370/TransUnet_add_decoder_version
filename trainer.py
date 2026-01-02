@@ -321,6 +321,10 @@ def trainer_synapse(args, model, snapshot_path):
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
     count = 0
+    explore_mode = 1
+    den_mean_ema = None
+    stage1_fg_ratio_ema = None
+    ema_alpha = 0.9   # 平滑程度（0.9～0.95 都合理）
     for epoch_num in iterator:
         model.train()
         
@@ -384,14 +388,17 @@ def trainer_synapse(args, model, snapshot_path):
                     padding=3
                 )
             # binary logit：fg > bg
-            fb_logit = (fg_logit - bg_logit)/2                          
-
-            # 計算 batch 內的前景比例（soft target 也可）
-            with torch.no_grad():
-                fg_frac = gt_is_fg.mean().clamp_min(1e-3)   # 避免除 0
-
-            pos_weight = (1.0 - fg_frac) / fg_frac
-            pos_weight = pos_weight.clamp(max=8.0)
+            fb_logit = (fg_logit - bg_logit)/2
+            # ---- 判斷目前是否仍在「探索期」 ----
+                                  
+            if explore_mode:
+                # Phase A：強迫探索（避免全背景）
+                pos_weight = torch.tensor([5.0], device=fb_logit.device)
+            else:
+                # Phase B：回到真實比例（你原本那套）
+                with torch.no_grad():
+                    fg_frac = gt_is_fg.mean().clamp_min(1e-3)
+                pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=8.0)
 
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit,
@@ -403,6 +410,7 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 # Stage-1 認為是前景
                 pred_is_fg = (fb_logit > 0).squeeze(1)   # (B,H,W)
+                pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
 
                 # GT 或 Stage-1 認為是前景
                 cls_mask = (label_ce > 0) | pred_is_fg   # (B,H,W)
@@ -416,7 +424,21 @@ def trainer_synapse(args, model, snapshot_path):
                     fg_logits.permute(0,2,3,1)[cls_mask_cls],             # (N_fg, C_fg)
                     (label_ce[cls_mask_cls] - 1).long()                   # class index from 0
                 )
-            
+            # --------------------------------------------------
+            # Update EMA (after computing den_raw & stage1 ratio)
+            # --------------------------------------------------
+            den_now = den_raw.mean().item()
+            fg_ratio_now = pred_fg_ratio_stage1
+
+            if den_mean_ema is None:
+                # first time init
+                den_mean_ema = den_now
+                stage1_fg_ratio_ema = fg_ratio_now
+            else:
+                den_mean_ema = ema_alpha * den_mean_ema + (1 - ema_alpha) * den_now
+                stage1_fg_ratio_ema = ema_alpha * stage1_fg_ratio_ema + (1 - ema_alpha) * fg_ratio_now
+
+
             #--------------Step 3：Dice 只輔助前景（保留，但弱化--------------
             semantic_prob = torch.softmax(semantic_logits, dim=1)
 
@@ -455,7 +477,11 @@ def trainer_synapse(args, model, snapshot_path):
                     # Stage-1 predicted FG ratio (should become reasonable, not necessarily 1.0)
                     pred_is_fg = (fb_logit > 0).float()                            # fg if fg_logit > bg_logit
                     pred_fg_ratio_stage1 = float(pred_is_fg.mean().item())
-
+                    
+                    explore_mode = (
+                        den_mean_ema < 1.2 or
+                        stage1_fg_ratio_ema < 0.1
+                    )
                     pred_is_fg = (fb_logit > 0).squeeze(1)        # (B,H,W) bool
                     gt_is_fg   = (label_ce > 0)
 
@@ -513,6 +539,11 @@ def trainer_synapse(args, model, snapshot_path):
                         f"{fb_logit.mean().item():.4f} / "
                         f"{fb_logit.min().item():.4f} / "
                         f"{fb_logit.max().item():.4f}"
+                    )
+                    print(
+                        f"[EMA] den={den_mean_ema:.3f} | "
+                        f"stage1_fg={stage1_fg_ratio_ema:.3f} | "
+                        f"explore_mode={explore_mode}"
                     )
                     print("=============================")
             # ======================================================
