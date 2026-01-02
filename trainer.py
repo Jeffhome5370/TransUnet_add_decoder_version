@@ -391,23 +391,38 @@ def trainer_synapse(args, model, snapshot_path):
             # binary logit：fg > bg
             fb_logit = (fg_logit - bg_logit)/2
             # ---- 判斷目前是否仍在「探索期」 ----
-                                  
-            if explore_mode:
-                # Phase A：強迫探索（避免全背景）
-                fb_logit = fb_logit + 0.3   # 或 0.2~0.5 之間
-                pos_weight = torch.tensor([5.0], device=fb_logit.device)
-            else:
-                # Phase B：回到真實比例（你原本那套）
-                with torch.no_grad():
-                    fg_frac = gt_is_fg.mean().clamp_min(1e-3)
-                pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=8.0)
+            gt_is_fg = (label_ce > 0).float().unsqueeze(1)
 
-            loss_fg_bg = F.binary_cross_entropy_with_logits(
-                fb_logit,
-                gt_is_fg,
-                pos_weight=pos_weight
-                
-            )
+            fb_flat = fb_logit.flatten()
+            gt_flat = gt_is_fg.flatten()   
+            pos_idx = (gt_flat > 0.5).nonzero(as_tuple=False).squeeze(1)
+            neg_idx = (gt_flat < 0.5).nonzero(as_tuple=False).squeeze(1)
+
+            loss_fg_bg = torch.tensor(0.0, device=fb_logit.device)     
+            if pos_idx.numel() > 0 and neg_idx.numel() > 0:         
+                if explore_mode:
+                    # Phase A：強迫探索（避免全背景）
+                    neg_fb = fb_flat[neg_idx]
+                    k = min(neg_idx.numel(), 10 * pos_idx.numel(), 8192)
+                    hard_neg = neg_idx[torch.topk(neg_fb, k=k, largest=True).indices]
+                    sel = torch.cat([pos_idx, hard_neg], dim=0)
+
+                    loss_fg_bg = F.binary_cross_entropy_with_logits(
+                        fb_flat[sel],
+                        gt_flat[sel]
+                    )
+                else:
+                    # Phase B：回到真實比例（你原本那套）
+                    with torch.no_grad():
+                        fg_frac = gt_is_fg.mean().clamp_min(1e-3)
+                    pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=8.0)
+
+                    loss_fg_bg = F.binary_cross_entropy_with_logits(
+                        fb_logit,
+                        gt_is_fg,
+                        pos_weight=pos_weight
+                        
+                    )
             # ---------- Stage 2: FG class (only on GT FG pixels) ----------
             with torch.no_grad():
                 # Stage-1 認為是前景
