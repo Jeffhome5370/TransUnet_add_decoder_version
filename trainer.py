@@ -501,7 +501,8 @@ def trainer_synapse(args, model, snapshot_path):
                     
                     explore_mode = (
                         den_mean_ema < 1.2 or
-                        stage1_fg_ratio_ema < 0.1
+                        stage1_fg_ratio_ema < 0.1 or
+                        stage1_fg_ratio_ema < 0.05
                     )
                     pred_is_fg = (fb_logit > 0).squeeze(1)        # (B,H,W) bool
                     gt_is_fg   = (label_ce > 0)
