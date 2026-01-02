@@ -406,14 +406,15 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # GT 或 Stage-1 認為是前景
                 cls_mask = (label_ce > 0) | pred_is_fg   # (B,H,W)
+                cls_mask_cls = (label_ce > 0) & cls_mask
 
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits.device)
 
-            if cls_mask.any():
+            if cls_mask_cls.any():
                 fg_logits = semantic_logits[:, 1:]                  # (B,C_fg,H,W)
                 loss_fg_cls = F.cross_entropy(
-                    fg_logits.permute(0,2,3,1)[cls_mask],             # (N_fg, C_fg)
-                    (label_ce[cls_mask] - 1).long()                   # class index from 0
+                    fg_logits.permute(0,2,3,1)[cls_mask_cls],             # (N_fg, C_fg)
+                    (label_ce[cls_mask_cls] - 1).long()                   # class index from 0
                 )
             
             #--------------Step 3：Dice 只輔助前景（保留，但弱化--------------
