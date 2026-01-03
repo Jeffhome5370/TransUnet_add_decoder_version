@@ -345,7 +345,7 @@ def trainer_synapse(args, model, snapshot_path):
                 with torch.no_grad():
                     pred = semantic_prob.argmax(dim=1)
                     pred_fg_ratio = float((pred > 0).float().mean().item())
-                    gt_fg_ratio = float((label_ce > 0).float().mean().item())
+                    #gt_fg_ratio = float((label_ce > 0).float().mean().item())
                     pred_unique = torch.unique(pred).detach().cpu().tolist()[:20]
 
                     # FG hist / dom
