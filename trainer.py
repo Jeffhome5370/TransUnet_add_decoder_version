@@ -205,7 +205,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 2.5).clamp(0.08, 0.25)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
+                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
 
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
@@ -258,7 +258,7 @@ def trainer_synapse(args, model, snapshot_path):
                 y = (label_ce[gt_fg] - 1).long()     # (N_fg,)
                 # batch-level class counts
                 counts = torch.bincount(y, minlength=8).float()  # (8,)
-                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 8.0)  # 反比權重，避免爆
+                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 20.0)  # 反比權重，避免爆
                 # normalize to keep scale stable
                 w = w / w.mean().clamp_min(1e-6)
 
@@ -267,6 +267,24 @@ def trainer_synapse(args, model, snapshot_path):
                     y,
                     weight=w.to(fg_logits.device)
                 )
+
+            # --- Stage2 aux: high-confidence pseudo-FG (SOFT) ---
+            with torch.no_grad():
+                prob = torch.softmax(semantic_logits2, dim=1)  # (B,9,H,W)
+                p_fg = 1.0 - prob[:, 0]                        # (B,H,W)
+                pred = prob.argmax(dim=1)                      # (B,H,W)
+
+                pseudo_mask = (pred > 0) & (p_fg > 0.90)       # 高信心前景
+                pseudo_y = (pred[pseudo_mask] - 1).long()      # 0..7
+
+            loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
+            if pseudo_mask.any():
+                fg_logits = semantic_logits2[:, 1:]            # (B,8,H,W)
+                logits_sel = fg_logits.permute(0,2,3,1)[pseudo_mask]  # (N,8)
+                # soft CE 用 label smoothing 避免互打
+                loss_pseudo = F.cross_entropy(logits_sel, pseudo_y, label_smoothing=0.10)
+
+            
 
             # ---- BG-only CE on GT background (small weight) ----
             gt_bg = (label_ce == 0)                 # (B,H,W)
@@ -380,6 +398,7 @@ def trainer_synapse(args, model, snapshot_path):
             lambda_cls_div = 1e-2
             lambda_bg = 0.01
             lambda_pix_div = 2e-2
+            lambda_pseudo = 0.15 
             
             loss = (
                 lambda_fb   * loss_fg_bg +
@@ -390,7 +409,8 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_ovlp * overlap_pen +
                 lambda_cls_div * loss_cls_div +
                 lambda_bg * loss_bg +
-                lambda_pix_div * loss_pix_div
+                lambda_pix_div * loss_pix_div +
+                lambda_pseudo * loss_pseudo
             )
 
             # ----------------------------
@@ -464,7 +484,9 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[overlap_pen] overlap_pen={overlap_pen.item():.4f} | weighted={lambda_ovlp * overlap_pen.item():.6f}")
                     print(f"[cls_div] loss_cls_div={loss_cls_div.item():.4f} | weighted={lambda_cls_div*loss_cls_div.item():.6f}")
                     print(f"[bg] loss_bg={loss_bg.item():.4f} | weighted={lambda_bg * loss_bg.item():.6f}")
-                    print(f"[pix_div] loss_pix_div={loss_pix_div.item():.4f} | weighted={lambda_pix_div * loss_pix_div.item():.6f}")       
+                    print(f"[pix_div] loss_pix_div={loss_pix_div.item():.4f} | weighted={lambda_pix_div * loss_pix_div.item():.6f}")
+                    print(f"[pseudo] loss_pseudo={loss_pseudo.item():.4f} | weighted={lambda_pseudo * loss_pseudo.item():.6f}")       
+                    
             # ----------------------------
             # backward / step
             # ----------------------------
