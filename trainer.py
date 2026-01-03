@@ -235,16 +235,19 @@ def trainer_synapse(args, model, snapshot_path):
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
             # ---- fuse Stage1 gate into semantic logits (log-prior) ----
-            gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
+            p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
+            prior = (0.5 - p_fg)                      # in [-0.5, 0.5]
+            #gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
 
-            semantic_logits2 = semantic_logits.clone()
+            
             with torch.no_grad():
                 dm = diff.mean().abs().item()
 
-            beta = float(np.clip(dm * 2.0, 2.0, 8.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
+            beta = float(np.clip(dm * 2.0, 1.0, 3.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
 
-            semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + beta * torch.log(1.0 - gate)
-            semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + beta * torch.log(gate)
+            semantic_logits2 = semantic_logits.clone()
+            semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + beta * prior
+            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - beta * prior
 
 
             gt_fg = (label_ce > 0)            # (B,H,W) bool
@@ -294,18 +297,17 @@ def trainer_synapse(args, model, snapshot_path):
                 target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
                 target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
             
-            pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
-            loss_fgcap = F.relu(pred_fg_ratio_soft - target_pred_fg).pow(2)
+            #pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
+            #loss_fgcap = F.relu(pred_fg_ratio_soft - target_pred_fg).pow(2)
 
             # ---- BG-only CE on GT background (small weight) ----
             gt_bg = (label_ce == 0)                 # (B,H,W)
-
             bg_l = semantic_logits2[:, 0]           # (B,H,W)
             fg_l = semantic_logits2[:, 1:].amax(dim=1)   # (B,H,W)
-
-            margin = 1.0
+            margin = 0.5
             viol = margin + fg_l - bg_l             # (B,H,W)
 
+            loss_fgcap = F.relu(viol).mean()
             loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
 
             
@@ -410,7 +412,7 @@ def trainer_synapse(args, model, snapshot_path):
             lambda_bg = 0.01
             lambda_pix_div = 2e-2
             lambda_pseudo = 0.05
-            lambda_fgcap = 0.5 
+            lambda_fgcap = 0.05 
             
             loss = (
                 lambda_fb   * loss_fg_bg +
