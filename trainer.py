@@ -383,23 +383,27 @@ def trainer_synapse(args, model, snapshot_path):
             gt_fg = (label_ce > 0)            # (B,H,W) bool
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
 
-            counts = torch.bincount(y, minlength=8).float()  # (8,)
+            if gt_fg.any():
+                fg_logits = semantic_logits2[:, 1:]                 # (B,8,H,W)
+                y = (label_ce[gt_fg] - 1).long()                    # (N_fg,) -> 0..7
+                logits_fg = fg_logits.permute(0,2,3,1)[gt_fg]
+                counts = torch.bincount(y, minlength=8).float()  # (8,)
 
-            with torch.no_grad():
-                freq = counts / counts.sum().clamp_min(1.0)
-                mom = 0.98
-                cls_ema = mom * cls_ema + (1 - mom) * freq
-                cls_ema = cls_ema / cls_ema.sum().clamp_min(1e-6)
+                with torch.no_grad():
+                    freq = counts / counts.sum().clamp_min(1.0)
+                    mom = 0.98
+                    cls_ema = mom * cls_ema + (1 - mom) * freq
+                    cls_ema = cls_ema / cls_ema.sum().clamp_min(1e-6)
 
-            # inverse-frequency weights from EMA (stable)
-            w = (1.0 / (cls_ema + 1e-3)).clamp(1.0, 6.0)
-            w = w / w.mean().clamp_min(1e-6)
+                # inverse-frequency weights from EMA (stable)
+                w = (1.0 / (cls_ema + 1e-3)).clamp(1.0, 6.0)
+                w = w / w.mean().clamp_min(1e-6)
 
-            loss_fg_cls = F.cross_entropy(
-                fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
-                y,
-                weight=w.to(fg_logits.device)
-            )
+                loss_fg_cls = F.cross_entropy(
+                    fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
+                    y,
+                    weight=w.to(fg_logits.device)
+                )
 
             # --- Stage2 aux: high-confidence pseudo-FG (SOFT) ---
             with torch.no_grad():
