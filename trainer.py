@@ -186,6 +186,11 @@ def trainer_synapse(args, model, snapshot_path):
     tau_ema = None
     cls_ema = torch.ones(8, device='cuda')  # init uniform-ish
     cls_ema = cls_ema / cls_ema.sum()
+    num_fg_classes = 8
+    #ema_cls_count = torch.ones(num_fg_classes, device='cuda')  # avoid zero
+    #ema_m = 0.99  # 越大越穩
+    cls_count_ema = torch.ones(num_fg_classes, device='cuda')  # init >0 to avoid inf
+    cls_mom = 0.99  # 越大越穩
     for epoch_num in iterator:
         model.train()
 
@@ -231,6 +236,21 @@ def trainer_synapse(args, model, snapshot_path):
             den = den_raw.clamp_min(0.2)                    # safe for division
             #semantic_logits = semantic_logits / den.unsqueeze(1)
             class_probs = torch.softmax(class_logits, dim=-1)                 # (B,Q,C) in [0,1], sum=1
+
+
+            q = class_probs[..., 1:]                    # (B,Q,8) 只看 FG 類別的機率質量
+            q = q.mean(dim=0)                                  # (Q,8) avg over batch
+            q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            # 讓 queries 的 class distribution 不要彼此太像：min cosine similarity
+            q_norm = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            sim = torch.matmul(q_norm, q_norm.t())             # (Q,Q)
+            margin = 0.9
+            eye = torch.eye(sim.size(0), device=sim.device)
+            sim_off = sim * (1.0 - eye)
+            loss_q_div = torch.relu(sim_off - margin).pow(2).mean()
+
+
             semantic_prob = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W) in [0,1]
             semantic_prob = semantic_prob / den.unsqueeze(1)
             semantic_prob = semantic_prob.clamp(1e-6, 1-1e-6)
@@ -253,53 +273,48 @@ def trainer_synapse(args, model, snapshot_path):
             if bg_bias_ema is None:
                 bg_bias_ema = torch.tensor(0.0, device=semantic_logits.device)
 
-            # --- fg% BEFORE bias (log only) ---
-            with torch.no_grad():
-                fg_before = (semantic_logits_raw.argmax(1) > 0).float().mean()
+            # apply current bias first (non-inplace) to measure fg%
+            bg0_tmp = semantic_logits_raw[:, 0:1] + bg_bias_ema
+            semantic_logits_cal = torch.cat([bg0_tmp, semantic_logits_raw[:, 1:]], dim=1)
 
-            # --- apply current bias (non-inplace) ---
+            with torch.no_grad():
+                fg_pre = (semantic_logits_cal.argmax(1) > 0).float().mean()
+
+            # controller target band
+            target = 0.12
+            lo, hi = 0.05, 0.25
+
+            with torch.no_grad():
+                if fg_pre.item() > 0.40:
+                    # emergency: fg is exploding
+                    step = torch.tensor(+0.25, device=semantic_logits.device)
+                    ema_w = 0.20
+                elif fg_pre.item() > hi:
+                    step = ((fg_pre - target) * 1.2).clamp(0.02, 0.12)   # push up
+                    ema_w = 0.05
+                elif fg_pre.item() < lo:
+                    step = ((fg_pre - target) * 1.2).clamp(-0.12, -0.02) # release bias
+                    ema_w = 0.03
+                else:
+                    step = torch.tensor(0.0, device=semantic_logits.device)
+                    ema_w = 0.02
+
+            # update bias (allow higher cap)
+            bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(0.0, 6.0)
+
+            # re-apply updated bias for actual use downstream
             bg_mean_before = semantic_logits_raw[:, 0].mean()
             bg0 = semantic_logits_raw[:, 0:1] + bg_bias_ema
-            semantic_logits_cal = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
-            bg_mean_after = semantic_logits_cal[:, 0].mean()
+            semantic_logits2 = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
+            bg_mean_after = semantic_logits2[:, 0].mean()
 
-            # --- fg% AFTER bias (feedback) ---
             with torch.no_grad():
-                fg_after = (semantic_logits_cal.argmax(1) > 0).float().mean()
-
-            # --- deadband controller ---
-            lo, hi = 0.05, 0.25
-            target = 0.12
-            gain = 0.8
-
-            # only act when outside [lo, hi]
-            if fg_after.item() > hi:
-                err = fg_after - target           # positive -> raise BG
-            elif fg_after.item() < lo:
-                err = fg_after - target           # negative -> lower BG
-            else:
-                err = torch.tensor(0.0, device=semantic_logits.device)
-
-            step = (err * gain).clamp(-0.08, 0.08)
-
-            # faster when badly off, otherwise slow
-            abs_err = float(abs(err).item())
-            if abs_err > 0.35:
-                ema_w = 0.08
-            elif abs_err > 0.28:
-                ema_w = 0.04
-            else:
-                ema_w = 0.01
-
-            bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(0.0, 2.5)
+                fg_post = (semantic_logits2.argmax(1) > 0).float().mean()
 
             if iter_num % 100 == 0:
-                print(
-                    f"[bias_fg] step={step.item():+.3f} bg_bias_ema={bg_bias_ema.item():.3f} "
-                    f"bg_delta={(bg_mean_after - bg_mean_before).item():+.3f} "
-                    f"fg% {fg_before.item():.4f}->{fg_after.item():.4f}"
-                )
-            semantic_logits2 = semantic_logits_cal
+                print(f"[bias_fg] step={step.item():+.3f} bg_bias_ema={bg_bias_ema.item():.3f} "
+                    f"bg_delta={(bg_mean_after-bg_mean_before).item():+.3f} "
+                    f"fg% {fg_pre.item():.4f}->{fg_post.item():.4f}")
             # ----------------------------
             # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
             # ----------------------------
@@ -390,22 +405,19 @@ def trainer_synapse(args, model, snapshot_path):
                 fg_logits = semantic_logits2[:, 1:]                 # (B,8,H,W)
                 y = (label_ce[gt_fg] - 1).long()                    # (N_fg,) -> 0..7
                 logits_fg = fg_logits.permute(0,2,3,1)[gt_fg]
-                counts = torch.bincount(y, minlength=8).float()  # (8,)
+                counts = torch.bincount(y, minlength=8).float().to(y.device)  # (8,)
 
                 with torch.no_grad():
-                    freq = counts / counts.sum().clamp_min(1.0)
-                    mom = 0.98
-                    cls_ema = mom * cls_ema + (1 - mom) * freq
-                    cls_ema = cls_ema / cls_ema.sum().clamp_min(1e-6)
+                    cls_count_ema.mul_(cls_mom).add_(counts, alpha=(1.0 - cls_mom))
 
-                # inverse-frequency weights from EMA (stable)
-                w = (1.0 / (cls_ema + 1e-3)).clamp(1.0, 6.0)
-                w = w / w.mean().clamp_min(1e-6)
+                    # inverse-freq weights
+                    w = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(1.0, 10.0)
+                    w = w / w.mean().clamp_min(1e-6)
 
                 loss_fg_cls = F.cross_entropy(
-                    fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
+                    logits_fg,
                     y,
-                    weight=w.to(fg_logits.device)
+                    weight=w
                 )
 
             # --- Stage2 aux: high-confidence pseudo-FG (SOFT) ---
@@ -443,7 +455,7 @@ def trainer_synapse(args, model, snapshot_path):
             gt_bg = (label_ce == 0)                 # (B,H,W)
             bg_l = semantic_logits2[:, 0]           # (B,H,W)
             fg_l = semantic_logits2[:, 1:].amax(dim=1)   # (B,H,W)
-            margin = 0.5
+            #margin = 0.5
             '''
             viol = margin + fg_l - bg_l             # (B,H,W)
 
@@ -496,6 +508,11 @@ def trainer_synapse(args, model, snapshot_path):
                     stage1_fg_ratio_ema = stage1_fg_ratio
                 else:
                     stage1_fg_ratio_ema = ema_alpha * stage1_fg_ratio_ema + (1 - ema_alpha) * stage1_fg_ratio
+                
+                # ---------- Stage1 gate safety guard ----------
+                # Stage1 太寬鬆時，輕微收緊 tau（下一 iter 生效）
+                if stage1_fg_ratio_ema > 0.35:
+                    tau_ema = tau_ema + 0.10
 
                 # hysteresis
                 if explore_mode:
@@ -534,14 +551,14 @@ def trainer_synapse(args, model, snapshot_path):
                 loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
             
             #============================================================
-
+            '''
             with torch.no_grad():
                 if pred_fg_ratio > 0.7:
                     with torch.no_grad():
                         pred_raw = semantic_logits.argmax(dim=1)
                         pred2    = semantic_logits2.argmax(dim=1)
                         print(f"[pred_fg_ratio] raw={(pred_raw>0).float().mean().item():.4f} | gated={(pred2>0).float().mean().item():.4f}")
-
+            '''
             # ----------------------------
             # LOSS weights 
             # ----------------------------
@@ -551,10 +568,11 @@ def trainer_synapse(args, model, snapshot_path):
             lambda_area = 2e-3       # query area dispersion
             lambda_ovlp = 1e-2       # overlap penalty (門檻提高後再給小權重)
             lambda_cls_div = 1e-2
-            lambda_bg = 0.01
-            lambda_pix_div = 2e-2
+            #lambda_bg = 0.01
+            lambda_pix_div = 0.02 if epoch_num < 1 else 0.08
             lambda_pseudo = 0.05
-            lambda_fgcap = 0.05 
+            #lambda_fgcap = 0.05
+            lambda_q_div = 5e-4 
             
             loss = (
                 lambda_fb   * loss_fg_bg +
@@ -566,8 +584,9 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_cls_div * loss_cls_div +
                 #lambda_bg * loss_bg +
                 lambda_pix_div * loss_pix_div +
-                lambda_pseudo * loss_pseudo
+                lambda_pseudo * loss_pseudo +
                 #lambda_fgcap * loss_fgcap
+                lambda_q_div * loss_q_div
             )
 
             # ----------------------------
