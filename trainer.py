@@ -184,6 +184,8 @@ def trainer_synapse(args, model, snapshot_path):
     # ----------------------------
     fb_div = 2.0  # 你原本 /3，先保留；若仍敏感再做 scale-EMA
     tau_ema = None
+    cls_ema = torch.ones(8, device='cuda')  # init uniform-ish
+    cls_ema = cls_ema / cls_ema.sum()
     for epoch_num in iterator:
         model.train()
 
@@ -277,13 +279,13 @@ def trainer_synapse(args, model, snapshot_path):
             else:
                 err = torch.tensor(0.0, device=semantic_logits.device)
 
-            step = (err * gain).clamp(-0.05, 0.05)
+            step = (err * gain).clamp(-0.08, 0.08)
 
             # faster when badly off, otherwise slow
             abs_err = float(abs(err).item())
-            if abs_err > 0.30:
+            if abs_err > 0.35:
                 ema_w = 0.08
-            elif abs_err > 0.15:
+            elif abs_err > 0.28:
                 ema_w = 0.04
             else:
                 ema_w = 0.01
@@ -381,21 +383,23 @@ def trainer_synapse(args, model, snapshot_path):
             gt_fg = (label_ce > 0)            # (B,H,W) bool
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
 
-            if gt_fg.any():
-                fg_logits = semantic_logits2[:, 1:]  # (B,8,H,W)
+            counts = torch.bincount(y, minlength=8).float()  # (8,)
 
-                y = (label_ce[gt_fg] - 1).long()     # (N_fg,)
-                # batch-level class counts
-                counts = torch.bincount(y, minlength=8).float()  # (8,)
-                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 10.0)  # 反比權重，避免爆
-                # normalize to keep scale stable
-                w = w / w.mean().clamp_min(1e-6)
+            with torch.no_grad():
+                freq = counts / counts.sum().clamp_min(1.0)
+                mom = 0.98
+                cls_ema = mom * cls_ema + (1 - mom) * freq
+                cls_ema = cls_ema / cls_ema.sum().clamp_min(1e-6)
 
-                loss_fg_cls = F.cross_entropy(
-                    fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
-                    y,
-                    weight=w.to(fg_logits.device)
-                )
+            # inverse-frequency weights from EMA (stable)
+            w = (1.0 / (cls_ema + 1e-3)).clamp(1.0, 6.0)
+            w = w / w.mean().clamp_min(1e-6)
+
+            loss_fg_cls = F.cross_entropy(
+                fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
+                y,
+                weight=w.to(fg_logits.device)
+            )
 
             # --- Stage2 aux: high-confidence pseudo-FG (SOFT) ---
             with torch.no_grad():
