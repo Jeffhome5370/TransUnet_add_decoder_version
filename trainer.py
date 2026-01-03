@@ -199,19 +199,12 @@ def trainer_synapse(args, model, snapshot_path):
 
             diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
 
+            
+            
             with torch.no_grad():
                 gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
-                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)      # 避免 0/太大
-
-                # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
-                # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
-                target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
-            
-            pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
-            loss_fgcap = F.relu(pred_fg_ratio_soft - target_pred_fg).pow(2)
-
-            with torch.no_grad():    
+                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5) 
+                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)    
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
                 flat = diff.detach().flatten()
@@ -291,7 +284,18 @@ def trainer_synapse(args, model, snapshot_path):
                 # soft CE 用 label smoothing 避免互打
                 loss_pseudo = F.cross_entropy(logits_sel, pseudo_y, label_smoothing=0.10)
 
+            #=============loss fg-cap===================================
+            with torch.no_grad():
+                gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
+                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)      # 避免 0/太大
+
+                # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
+                # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
+                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
+                target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
             
+            pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
+            loss_fgcap = F.relu(pred_fg_ratio_soft - target_pred_fg).pow(2)
 
             # ---- BG-only CE on GT background (small weight) ----
             gt_bg = (label_ce == 0)                 # (B,H,W)
