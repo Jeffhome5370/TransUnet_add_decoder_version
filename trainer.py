@@ -139,14 +139,7 @@ def trainer_synapse(args, model, snapshot_path):
     bg_keep_prob = 0.2
     min_fg_ratio = 0.005  # 0.5%
 
-    # ----------------------------
-    # LOSS weights (止血版起手式)
-    # ----------------------------
-    lambda_fb   = 1.0
-    lambda_dice = 0.2        # 先弱化 dice，避免和 stage loss 互打
-    lambda_cov  = 1e-2       # GT fg coverage
-    lambda_area = 2e-3       # query area dispersion
-    lambda_ovlp = 1e-2       # overlap penalty (門檻提高後再給小權重)
+    
 
     # ----------------------------
     # Stage1 scaling (先固定，避免你現在 /3 亂飄)
@@ -212,7 +205,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 2.5).clamp(0.02, 0.30)
+                target_ratio = (gt_fg_ratio * 4.0).clamp(0.02, 0.30)
 
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
@@ -278,7 +271,7 @@ def trainer_synapse(args, model, snapshot_path):
 
             loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
 
-            lambda_bg = 0.01
+            
             # ----------------------------
             # Dice (輔助，弱化)
             # ----------------------------
@@ -345,7 +338,7 @@ def trainer_synapse(args, model, snapshot_path):
 
             u = torch.full_like(p_cls, 1.0 / p_cls.numel())
             loss_cls_div = torch.sum(p_cls * (p_cls.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
-            lambda_cls_div = 1e-2
+            
             #============================================================
 
             # ---- pixel-level anti-collapse on predicted FG distribution ----
@@ -361,12 +354,26 @@ def trainer_synapse(args, model, snapshot_path):
                 loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
             else:
                 loss_pix_div = torch.tensor(0.0, device=semantic_prob.device)
-            lambda_pix_div = 5e-3
+            
             #============================================================
 
             # ----------------------------
             # Total loss (止血版，不互打)
             # ----------------------------
+
+            
+            # ----------------------------
+            # LOSS weights 
+            # ----------------------------
+            lambda_fb   = 1.0
+            lambda_dice = 0.2        # 先弱化 dice，避免和 stage loss 互打
+            lambda_cov  = 1e-2       # GT fg coverage
+            lambda_area = 2e-3       # query area dispersion
+            lambda_ovlp = 1e-2       # overlap penalty (門檻提高後再給小權重)
+            lambda_cls_div = 1e-2
+            lambda_bg = 0.01
+            lambda_pix_div = 1e-2
+            
             loss = (
                 lambda_fb   * loss_fg_bg +
                 lambda_cls  * loss_fg_cls +
