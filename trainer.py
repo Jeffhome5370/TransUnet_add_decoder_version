@@ -513,7 +513,7 @@ def trainer_synapse(args, model, snapshot_path):
         # ================================
         # Validation Stage (保留你原本版本)
         # ================================
-        if (epoch_num % 10 == 0):
+        if (epoch_num % 1 == 0):
             model.eval()
 
             dice_per_class = {c: [] for c in range(1, args.num_classes)}
