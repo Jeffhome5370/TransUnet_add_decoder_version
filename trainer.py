@@ -114,8 +114,38 @@ def trainer_synapse(args, model, snapshot_path):
     # ----------------------------
     # optimizer only on trainable params
     # ----------------------------
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.0001)
+
+
+    m = model.module if isinstance(model, nn.DataParallel) else model
+
+    # 取出 class_head 參數
+    class_head_params = list(m.class_head.parameters())
+
+    # 其餘可訓練參數（排除 class_head）
+    other_trainable_params = []
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("class_head."):
+            continue
+        other_trainable_params.append(p)
+
+    optimizer = optim.AdamW(
+        [
+            {"params": other_trainable_params, "lr": base_lr},
+            {"params": class_head_params, "lr": base_lr * 0.1},
+        ],
+        weight_decay=0.0001
+    )
+    trainable_params = other_trainable_params + class_head_params
+    print("Trainable param tensors (other):", len(other_trainable_params))
+    print("Trainable param tensors (class_head):", len(class_head_params))
+    print("Optimizer param groups:", len(optimizer.param_groups))
+    print("Params in group0(other):", len(optimizer.param_groups[0]["params"]))
+    print("Params in group1(class_head):", len(optimizer.param_groups[1]["params"]))
+
+
+
     print("Trainable param tensors:", len(trainable_params))
     print("Trainable param elements:", sum(p.numel() for p in trainable_params))
     print("Optimizer param groups:", len(optimizer.param_groups))
@@ -131,6 +161,7 @@ def trainer_synapse(args, model, snapshot_path):
     # ----------------------------
     explore_mode = True
     stage1_fg_ratio_ema = None
+    bg_bias_ema = None
     ema_alpha = 0.95
 
     # ----------------------------
@@ -204,8 +235,9 @@ def trainer_synapse(args, model, snapshot_path):
             if bg_bias_ema is None:
                 bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)  # 你目前接近這量級
             else:
-                bg_bias_ema = 0.99 * bg_bias_ema + 0.01 * (bg_bias_ema + bg_bias_step)
+                bg_bias_ema = 0.995 * bg_bias_ema + 0.005 * (bg_bias_ema + bg_bias_step)
 
+            bg_bias_ema = bg_bias_ema.clamp(0.0, 2.5)
             semantic_logits[:, 0:1] += bg_bias_ema
 
             # ----------------------------
@@ -260,6 +292,8 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[bg] mean={bg.mean().item():.3f} min={bg.min().item():.3f} max={bg.max().item():.3f}")
                     print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
                     print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
+                    print(f"[bg_bias_ema] {float(bg_bias_ema.item()):.3f}") 
+                    print(f"[raw_fg={raw_fg.item():.3f}] [bg_bias_ema={bg_bias_ema.item():.3f}]")
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
@@ -562,9 +596,10 @@ def trainer_synapse(args, model, snapshot_path):
 
             # poly lr schedule (保留你原本)
             min_lr = base_lr * 0.05
-            lr_ = min_lr + (base_lr - min_lr) * (1.0 - iter_num / max_iterations) ** 0.9
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr_
+            lr_main = min_lr + (base_lr - min_lr) * (1.0 - iter_num / max_iterations) ** 0.9
+
+            optimizer.param_groups[0]["lr"] = lr_main          # other params
+            optimizer.param_groups[1]["lr"] = lr_main * 0.1    # class_head
 
             iter_num += 1
 
