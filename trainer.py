@@ -270,7 +270,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ---- BG-only CE on GT background (small weight) ----
             gt_bg = (label_ce == 0)  # (B,H,W)
             # 在 GT bg 上：希望 bg_logit >= max_fg_logit + margin
-            bg_l = semantic_logits2[:, 0:1]                    # (B,1,H,W)
+            bg_l = semantic_logits2[:, 0]                    # (B,1,H,W)
             fg_l = semantic_logits2[:, 1:].amax(dim=1, keepdim=True)  # (B,1,H,W)
 
             margin = 1.0
