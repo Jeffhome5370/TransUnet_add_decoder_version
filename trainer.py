@@ -268,16 +268,17 @@ def trainer_synapse(args, model, snapshot_path):
                 )
 
             # ---- BG-only CE on GT background (small weight) ----
-            gt_bg = (label_ce == 0)  # (B,H,W)
-            # 在 GT bg 上：希望 bg_logit >= max_fg_logit + margin
-            bg_l = semantic_logits2[:, 0]                    # (B,1,H,W)
-            fg_l = semantic_logits2[:, 1:].amax(dim=1, keepdim=True)  # (B,1,H,W)
+            gt_bg = (label_ce == 0)                 # (B,H,W)
+
+            bg_l = semantic_logits2[:, 0]           # (B,H,W)
+            fg_l = semantic_logits2[:, 1:].amax(dim=1)   # (B,H,W)
 
             margin = 1.0
-            viol = (margin + fg_l - bg_l)  # >0 表示背景被前景壓過
+            viol = margin + fg_l - bg_l             # (B,H,W)
+
             loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
-            
-            lambda_bg = 0.01 
+
+            lambda_bg = 0.01
             # ----------------------------
             # Dice (輔助，弱化)
             # ----------------------------
