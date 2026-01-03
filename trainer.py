@@ -241,7 +241,8 @@ def trainer_synapse(args, model, snapshot_path):
             prior = torch.tanh((-diff) / 2.0)                      # in [-0.5, 0.5]
             with torch.no_grad():
                 dm = diff.mean().abs().item()
-            beta = float(np.clip(dm, 0.5, 1.5))  # 不要乘 2，先小一點
+            #beta = float(np.clip(dm, 0.5, 1.5))  # 不要乘 2，先小一點
+            beta = 1
             fg_region = (diff > tau + 0.5).float()  # (B,1,H,W)
             s = 0.5  # 0.3~1.0 之間都可
             w = torch.exp(-(diff - tau ).clamp(min=0.0) / s)  # diff 越高，推力越小
@@ -250,7 +251,7 @@ def trainer_synapse(args, model, snapshot_path):
             
             semantic_logits2 = semantic_logits.clone()
             semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
-            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
+            #semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
 
 
             gt_fg = (label_ce > 0)            # (B,H,W) bool
@@ -401,13 +402,9 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 if pred_fg_ratio > 0.7:
                     with torch.no_grad():
-                        print(f"[fg_region] mean={fg_region.mean().item():.4f}")
-                        print(f"[diff] mean/min/max={diff.mean().item():.4f} / {diff.min().item():.4f} / {diff.max().item():.4f}")
-                        print(f"[prior] mean/min/max={prior.mean().item():.4f} / {prior.min().item():.4f} / {prior.max().item():.4f}")
-                        print(f"[delta] beta={beta:.3f} mean/min/max="
-                            f"{delta.mean().item():.4f} / {delta.min().item():.4f} / {delta.max().item():.4f}")
-                        print(f"[fg_region] mean={fg_region.mean().item():.4f}")
-                        print(f"[delta] mean/min/max={delta.mean().item():.4f} / {delta.min().item():.4f} / {delta.max().item():.4f}")
+                        pred_raw = semantic_logits.argmax(dim=1)
+                        pred2    = semantic_logits2.argmax(dim=1)
+                        print(f"[pred_fg_ratio] raw={(pred_raw>0).float().mean().item():.4f} | gated={(pred2>0).float().mean().item():.4f}")
 
             # ----------------------------
             # LOSS weights 
