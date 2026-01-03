@@ -224,18 +224,21 @@ def trainer_synapse(args, model, snapshot_path):
             
             # ---- multi-class extreme-value correction ----
             with torch.no_grad():
-                raw_fg = (semantic_logits.argmax(1) > 0).float().mean()
+                raw_fg_ratio = (semantic_logits.argmax(1) > 0).float().mean()
 
             # target fg% ~ 0.12 (可改 0.10~0.15)
             target = 0.12
             k = 2.0  # gain
-            bg_bias_step = (raw_fg - target) * k        # fg 太高 -> bg_bias_step > 0 -> 抬 BG
-            bg_bias_step = bg_bias_step.clamp(-0.05, 0.05)
+            bg_bias_step = (raw_fg_ratio - target) * k        # fg 太高 -> bg_bias_step > 0 -> 抬 BG
+            bg_bias_step = bg_bias_step.clamp(-0.15, 0.15)
 
             if bg_bias_ema is None:
                 bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)  # 你目前接近這量級
+            elif raw_fg_ratio.item() > 0.50:
+                ema_w = 0.05
             else:
-                bg_bias_ema = 0.995 * bg_bias_ema + 0.005 * (bg_bias_ema + bg_bias_step)
+                ema_w = 0.005
+            bg_bias_ema = (1-ema_w)*bg_bias_ema + ema_w*(bg_bias_ema + bg_bias_step)
 
             bg_bias_ema = bg_bias_ema.clamp(0.0, 2.5)
             semantic_logits[:, 0:1] += bg_bias_ema
@@ -293,7 +296,7 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
                     print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
                     print(f"[bg_bias_ema] {float(bg_bias_ema.item()):.3f}") 
-                    print(f"[raw_fg={raw_fg.item():.3f}] [bg_bias_ema={bg_bias_ema.item():.3f}]")
+                    print(f"[bg_bias_ema={bg_bias_ema.item():.3f}]")
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
@@ -650,7 +653,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 "train/pos_weight": float(pos_weight.item()),
                 "train/explore_mode": int(explore_mode),
-                "lr": lr_,
+                "lr_main": lr_main,
             })
 
             writer.add_scalar("loss/total", loss.item(), iter_num)
@@ -663,7 +666,7 @@ def trainer_synapse(args, model, snapshot_path):
             writer.add_scalar("stat/stage1_fg_ratio", stage1_fg_ratio, iter_num)
             writer.add_scalar("stat/explore_mode", int(explore_mode), iter_num)
             writer.add_scalar("stat/pos_weight", float(pos_weight.item()), iter_num)
-            writer.add_scalar("lr", lr_, iter_num)
+            writer.add_scalar("lr_main", lr_main, iter_num)
 
             logging.info(
                 f"iter {iter_num:5d} | "
