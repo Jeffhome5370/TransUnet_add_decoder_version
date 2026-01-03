@@ -203,16 +203,36 @@ def trainer_synapse(args, model, snapshot_path):
             # ----------------------------
             bg_logit = semantic_logits[:, 0:1]                      # (B,1,H,W)
             fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
-            fb_logit = (fg_logit - bg_logit) / fb_div               # (B,1,H,W)
+
+            diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
 
             with torch.no_grad():
-                gt_is_fg = (label_ce > 0).float().unsqueeze(1)
+                gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
+                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)      # 避免 0/太大
+
+                # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
+                # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
+                target_ratio = (gt_fg_ratio * 1.5).clamp(0.02, 0.30)
+
+                # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
+                # pred_is_fg = diff > tau
+                flat = diff.detach().flatten()
+                N = flat.numel()
+                k = int((1.0 - float(target_ratio.item())) * N)
+                k = max(0, min(N - 1, k))
+                tau = flat.kthvalue(k + 1).values   # kthvalue 是 1-based
+
+            # 把 tau 當成 bias：fb_logit = diff - tau
+            # 注意：tau detached，所以不會反傳梯度造成奇怪震盪
+            fb_logit = (diff - tau).clamp(-12, 12)  # 可選：避免爆尺度
+
+            # pos_weight（你原本那套保留，但上限 80 比較合理）
+            with torch.no_grad():
                 fg_frac = gt_is_fg.mean().clamp_min(1e-4)
                 pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=80.0)
 
-            fb_logit_adj = fb_logit - 0.5
-            loss_fg_bg = focal_bce_with_logits(
-                fb_logit_adj, gt_is_fg, alpha=0.80, gamma=2.0, pos_weight=pos_weight
+            loss_fg_bg = F.binary_cross_entropy_with_logits(
+                fb_logit, gt_is_fg, pos_weight=pos_weight
             )
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
@@ -378,6 +398,7 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[den_raw] mean/min/max: {den_mean:.4f} / {den_min:.4f} / {den_max:.4f} | den_fg={den_fg_dbg:.4f}")
                     print(f"[query] N_eff={N_eff:.2f} (<=Q={Q}) | area_H={float(H.item()):.3f}")
                     print(f"[EMA] stage1_fg_ema={stage1_fg_ratio_ema:.3f} | explore_mode={explore_mode}")
+                    print(f"[stage1 calib] gt_fg_ratio={gt_fg_ratio.item():.4f} target_ratio={target_ratio.item():.4f} tau={tau.item():.3f} diff_mean={diff.mean().item():.3f}")
                     print("=====================================================================")
 
             # ----------------------------
