@@ -264,20 +264,32 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 fg_after = (semantic_logits.argmax(1) > 0).float().mean()
 
-            # --- controller update (use fg_after) ---
-            target_fg = 0.12
-            gain = 1.0                     # 0.6~1.5 可調；先用 1.0
-            step = (fg_after - target_fg) * gain
-            step = step.clamp(-0.10, 0.10) # 每步最多動 0.10，避免暴衝
+            # --- deadband controller ---
+            lo, hi = 0.05, 0.25
+            target = 0.12
+            gain = 0.8
 
-            # faster when very wrong
-            ema_w = 0.05 if fg_after.item() > 0.50 else 0.01
+            # only act when outside [lo, hi]
+            if fg_after.item() > hi:
+                err = fg_after - target           # positive -> raise BG
+            elif fg_after.item() < lo:
+                err = fg_after - target           # negative -> lower BG
+            else:
+                err = torch.tensor(0.0, device=semantic_logits.device)
 
-            # fg 太高 -> step>0 -> 增加 bg_bias
-            # fg 太低 -> step<0 -> 減少 bg_bias
+            step = (err * gain).clamp(-0.05, 0.05)
+
+            # faster when badly off, otherwise slow
+            abs_err = float(abs(err).item())
+            if abs_err > 0.30:
+                ema_w = 0.08
+            elif abs_err > 0.15:
+                ema_w = 0.04
+            else:
+                ema_w = 0.01
+
             bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(0.0, 2.5)
 
-            # --- logging ---
             if iter_num % 100 == 0:
                 print(
                     f"[bias_fg] step={step.item():+.3f} bg_bias_ema={bg_bias_ema.item():.3f} "
