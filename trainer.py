@@ -192,14 +192,27 @@ def trainer_synapse(args, model, snapshot_path):
             semantic_logits = semantic_logits / den.unsqueeze(1)
             
             # ---- multi-class extreme-value correction ----
-            BG_BIAS = 2.0  # 先從 2.0 起跳很合理（8類max偏差量級）
-            semantic_logits[:, 0:1] += BG_BIAS
-            
+            with torch.no_grad():
+                raw_fg = (semantic_logits.argmax(1) > 0).float().mean()
+
+            # target fg% ~ 0.12 (可改 0.10~0.15)
+            target = 0.12
+            k = 2.0  # gain
+            bg_bias_step = (raw_fg - target) * k        # fg 太高 -> bg_bias_step > 0 -> 抬 BG
+            bg_bias_step = bg_bias_step.clamp(-0.05, 0.05)
+
+            if bg_bias_ema is None:
+                bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)  # 你目前接近這量級
+            else:
+                bg_bias_ema = 0.99 * bg_bias_ema + 0.01 * (bg_bias_ema + bg_bias_step)
+
+            semantic_logits[:, 0:1] += bg_bias_ema
+
             # ----------------------------
             # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
             # ----------------------------
             bg_logit = semantic_logits[:, 0:1]                      # (B,1,H,W)
-            fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
+            fg_logit = semantic_logits[:, 1:].amax(1, True)   # 取 max，和 argmax 競爭一致
 
             diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
 
@@ -280,7 +293,7 @@ def trainer_synapse(args, model, snapshot_path):
                 y = (label_ce[gt_fg] - 1).long()     # (N_fg,)
                 # batch-level class counts
                 counts = torch.bincount(y, minlength=8).float()  # (8,)
-                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 20.0)  # 反比權重，避免爆
+                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 10.0)  # 反比權重，避免爆
                 # normalize to keep scale stable
                 w = w / w.mean().clamp_min(1e-6)
 
