@@ -239,17 +239,15 @@ def trainer_synapse(args, model, snapshot_path):
             # ---- fuse Stage1 gate into semantic logits (log-prior) ----
             #p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
             prior = torch.tanh((-diff) / 2.0)                      # in [-0.5, 0.5]
-            
-            #gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
-            
-            
             with torch.no_grad():
                 dm = diff.mean().abs().item()
-            beta = float(np.clip(dm * 2.0, 1.0, 3.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
+            beta = float(np.clip(dm, 0.5, 1.5))  # 不要乘 2，先小一點
             fg_region = (diff > tau).float()  # (B,1,H,W)
-            delta = beta * prior * fg_region
-            delta = delta.clamp(-0.5, 0.5)
-
+            s = 0.5  # 0.3~1.0 之間都可
+            w = torch.exp(-(diff - tau).clamp(min=0.0) / s)  # diff 越高，推力越小
+            delta = beta * prior * fg_region * w
+            delta = delta.clamp(-0.2, 0.2)
+            
             semantic_logits2 = semantic_logits.clone()
             semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
             semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
@@ -404,10 +402,7 @@ def trainer_synapse(args, model, snapshot_path):
                 if pred_fg_ratio > 0.7:
                     with torch.no_grad():
                         print(f"[fg_region] mean={fg_region.mean().item():.4f}")
-                        print(f"[diff] mean/min/max={diff.mean().item():.4f} / {diff.min().item():.4f} / {diff.max().item():.4f}")
-                        print(f"[prior] mean/min/max={prior.mean().item():.4f} / {prior.min().item():.4f} / {prior.max().item():.4f}")
-                        print(f"[delta] beta={beta:.3f} mean/min/max="
-                            f"{delta.mean().item():.4f} / {delta.min().item():.4f} / {delta.max().item():.4f}")
+                        print(f"[delta] mean/min/max={delta.mean().item():.4f} / {delta.min().item():.4f} / {delta.max().item():.4f}")
 
             # ----------------------------
             # LOSS weights 
