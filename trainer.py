@@ -212,7 +212,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 1.5).clamp(0.02, 0.30)
+                target_ratio = (gt_fg_ratio * 2.5).clamp(0.02, 0.30)
 
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
@@ -237,11 +237,19 @@ def trainer_synapse(args, model, snapshot_path):
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
+            # ---- fuse Stage1 gate into semantic logits (log-prior) ----
+            gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
+
+            semantic_logits2 = semantic_logits.clone()
+            semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + torch.log(1.0 - gate)  # BG
+            semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + torch.log(gate)  
+
+
             gt_fg = (label_ce > 0)            # (B,H,W) bool
-            loss_fg_cls = torch.tensor(0.0, device=semantic_logits.device)
+            loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
 
             if gt_fg.any():
-                fg_logits = semantic_logits[:, 1:]  # (B,8,H,W)
+                fg_logits = semantic_logits2[:, 1:]  # (B,8,H,W)
 
                 # fg-only class weights (batch-wise, sqrt inverse, clamp)
                 with torch.no_grad():
@@ -258,12 +266,23 @@ def trainer_synapse(args, model, snapshot_path):
                     weight=w
                 )
 
+            # ---- BG-only CE on GT background (small weight) ----
+            gt_bg = (label_ce == 0)  # (B,H,W)
+            loss_bg = torch.tensor(0.0, device=label_ce.device)
+            if gt_bg.any():
+                # 只在 GT 背景像素上，讓 BG logit 要大於 FG
+                # 用 full CE 最簡單（target=0）
+                loss_bg = F.cross_entropy(
+                    semantic_logits2.permute(0,2,3,1)[gt_bg],  # (N_bg, 9)
+                    label_ce[gt_bg]                            # all zeros
+                )
+            lambda_bg = 0.05 
             # ----------------------------
             # Dice (輔助，弱化)
             # ----------------------------
-            semantic_prob = torch.softmax(semantic_logits, dim=1)
+            semantic_prob = torch.softmax(semantic_logits2, dim=1)
             loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if gt_fg.any() else \
-                torch.tensor(0.0, device=semantic_logits.device)
+                torch.tensor(0.0, device=semantic_logits2.device)
 
             # ----------------------------
             # Regularization (止血版)
@@ -324,7 +343,25 @@ def trainer_synapse(args, model, snapshot_path):
 
             u = torch.full_like(p_cls, 1.0 / p_cls.numel())
             loss_cls_div = torch.sum(p_cls * (p_cls.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
-            lambda_cls_div = 2e-3
+            lambda_cls_div = 1e-2
+            #============================================================
+
+            # ---- pixel-level anti-collapse on predicted FG distribution ----
+            with torch.no_grad():
+                pred_fg = (label_ce > 0)  # 你也可以改成 pred_is_fg（Stage1 gate）做更強約束
+
+            pmap = semantic_prob[:, 1:]  # (B,8,H,W)
+            # 用 GT fg pixels 統計「模型預測的前景類別分布」
+            if pred_fg.any():
+                p_fg = pmap.permute(0,2,3,1)[pred_fg].mean(dim=0)  # (8,)
+                p_fg = p_fg / p_fg.sum().clamp_min(1e-6)
+                u = torch.full_like(p_fg, 1.0 / p_fg.numel())
+                loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
+            else:
+                loss_pix_div = torch.tensor(0.0, device=semantic_prob.device)
+            lambda_pix_div = 5e-3
+            #============================================================
+
             # ----------------------------
             # Total loss (止血版，不互打)
             # ----------------------------
@@ -335,7 +372,9 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_cov  * loss_cov +
                 lambda_area * area_pen +
                 lambda_ovlp * overlap_pen +
-                lambda_cls_div * loss_cls_div
+                lambda_cls_div * loss_cls_div +
+                lambda_bg * loss_bg +
+                lambda_pix_div * loss_pix_div
             )
 
             # ----------------------------
@@ -400,7 +439,16 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[EMA] stage1_fg_ema={stage1_fg_ratio_ema:.3f} | explore_mode={explore_mode}")
                     print(f"[stage1 calib] gt_fg_ratio={gt_fg_ratio.item():.4f} target_ratio={target_ratio.item():.4f} tau={tau.item():.3f} diff_mean={diff.mean().item():.3f}")
                     print("=====================================================================")
-
+                    print("All Loss elegant")
+                    print(f"[fg_bg] loss_fg_bg={loss_fg_bg.item():.4f} | weighted={lambda_fb*loss_fg_bg.item():.6f}")
+                    print(f"[fg_cls] loss_fg_cls={loss_fg_cls.item():.4f} | weighted={lambda_cls  * loss_fg_cls.item():.6f}")
+                    print(f"[dice] loss_dice={loss_dice.item():.4f} | weighted={lambda_dice * loss_dice.item():.6f}")
+                    print(f"[cov] loss_cov={loss_cov.item():.4f} | weighted={lambda_cov  * loss_cov.item():.6f}")
+                    print(f"[area] area_pen={area_pen.item():.4f} | weighted={lambda_area * area_pen.item():.6f}")
+                    print(f"[overlap_pen] overlap_pen={overlap_pen.item():.4f} | weighted={lambda_ovlp * overlap_pen.item():.6f}")
+                    print(f"[cls_div] loss_cls_div={loss_cls_div.item():.4f} | weighted={lambda_cls_div*loss_cls_div.item():.6f}")
+                    print(f"[bg] loss_bg={loss_bg.item():.4f} | weighted={lambda_bg * loss_bg.item():.6f}")
+                    print(f"[pix_div] loss_pix_div={loss_pix_div.item():.4f} | weighted={lambda_pix_div * loss_pix_div.item():.6f}")       
             # ----------------------------
             # backward / step
             # ----------------------------
