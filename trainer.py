@@ -204,7 +204,7 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
                 gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5) 
-                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)    
+                target_ratio = (gt_fg_ratio * 2.0).clamp(0.03, 0.12)    
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
                 flat = diff.detach().flatten()
@@ -216,9 +216,11 @@ def trainer_synapse(args, model, snapshot_path):
             if tau_ema is None:
                 tau_ema = tau_batch
             else:
-                tau_ema = 0.9 * tau_ema + 0.1 * tau_batch
+                if iter_num % 10 == 0:
+                    tau_ema = tau_batch if tau_ema is None else 0.98 * tau_ema + 0.02 * tau_batch
+                #tau_ema = 0.9 * tau_ema + 0.1 * tau_batch
 
-            tau = tau_ema.detach()
+            tau = tau_ema
             fb_logit = (diff - tau).clamp(-12, 12)
             # 把 tau 當成 bias：fb_logit = diff - tau
             # 注意：tau detached，所以不會反傳梯度造成奇怪震盪
@@ -279,7 +281,7 @@ def trainer_synapse(args, model, snapshot_path):
                 pseudo_mask = (pred > 0) & pred_is_fg & (p_fg > 0.92)      # 高信心前景
                 pseudo_y = (pred[pseudo_mask] - 1).long()      # 0..7
 
-            enable_pseudo = (pred_fg_ratio < 0.60)
+            enable_pseudo = (pred_fg_ratio < 0.60 and epoch_num > 5)
             loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
             if enable_pseudo and pseudo_mask.any():
                 fg_logits = semantic_logits2[:, 1:]            # (B,8,H,W)
@@ -294,7 +296,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 3.0).clamp(0.03, 0.20)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
+                target_ratio = (gt_fg_ratio * 2.0).clamp(0.03, 0.12)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
                 target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
             
             #pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
