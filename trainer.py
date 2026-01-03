@@ -239,17 +239,18 @@ def trainer_synapse(args, model, snapshot_path):
             # ---- fuse Stage1 gate into semantic logits (log-prior) ----
             p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
             prior = (0.5 - p_fg)                      # in [-0.5, 0.5]
+            prior = prior.clamp(-2.0, 2.0)   # 先止血，別讓 prior 太極端
             #gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
-
+            
             
             with torch.no_grad():
                 dm = diff.mean().abs().item()
-
+            fg_region = (diff > tau).float()  # (B,1,H,W)
             beta = float(np.clip(dm * 2.0, 1.0, 3.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
 
             semantic_logits2 = semantic_logits.clone()
             semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + beta * prior
-            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - beta * prior
+            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - fg_region * (beta * prior) 
 
 
             gt_fg = (label_ce > 0)            # (B,H,W) bool
@@ -281,7 +282,7 @@ def trainer_synapse(args, model, snapshot_path):
                 pseudo_mask = (pred > 0) & pred_is_fg & (p_fg > 0.92)      # 高信心前景
                 pseudo_y = (pred[pseudo_mask] - 1).long()      # 0..7
 
-            enable_pseudo = (pred_fg_ratio < 0.60 and epoch_num > 5)
+            enable_pseudo = (pred_fg_ratio < 0.60 and epoch_num > 1)
             loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
             if enable_pseudo and pseudo_mask.any():
                 fg_logits = semantic_logits2[:, 1:]            # (B,8,H,W)
@@ -397,11 +398,12 @@ def trainer_synapse(args, model, snapshot_path):
             
             #============================================================
 
-            # ----------------------------
-            # Total loss (止血版，不互打)
-            # ----------------------------
-
+            with torch.no_grad():
+                if pred_fg_ratio > 0.7:
+                    print("[prior] mean/min/max:",
+                        float(prior.mean()), float(prior.min()), float(prior.max()))
             
+
             # ----------------------------
             # LOSS weights 
             # ----------------------------
