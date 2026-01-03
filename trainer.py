@@ -216,12 +216,16 @@ def trainer_synapse(args, model, snapshot_path):
             mask_probs = torch.sigmoid(mask_logits)  # (B,Q,H,W)
 
             # semantic logits = einsum(class_logits (logits), mask_probs)
-            semantic_logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_probs)
+            #semantic_logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_probs)
 
             den_raw = mask_probs.sum(dim=1)                 # (B,H,W)
             den = den_raw.clamp_min(0.2)                    # safe for division
-            semantic_logits = semantic_logits / den.unsqueeze(1)
-            
+            #semantic_logits = semantic_logits / den.unsqueeze(1)
+            class_probs = torch.softmax(class_logits, dim=-1)                 # (B,Q,C) in [0,1], sum=1
+            semantic_prob = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W) in [0,1]
+            semantic_prob = semantic_prob / den.unsqueeze(1)
+            semantic_prob = semantic_prob.clamp(1e-6, 1-1e-6)
+            semantic_logits = torch.log(semantic_prob)    
             # ---- multi-class extreme-value correction ----
             with torch.no_grad():
                 raw_fg_ratio = (semantic_logits.argmax(1) > 0).float().mean()
@@ -230,17 +234,16 @@ def trainer_synapse(args, model, snapshot_path):
             target = 0.12
             k = 2.0  # gain
             bg_bias_step = (raw_fg_ratio - target) * k        # fg 太高 -> bg_bias_step > 0 -> 抬 BG
-            bg_bias_step = bg_bias_step.clamp(-0.15, 0.15)
+            bg_bias_step = bg_bias_step.clamp(-0.30, 0.30)
 
             if bg_bias_ema is None:
-                bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)  # 你目前接近這量級
-            elif raw_fg_ratio.item() > 0.50:
-                ema_w = 0.05
-            else:
-                ema_w = 0.005
-            bg_bias_ema = (1-ema_w)*bg_bias_ema + ema_w*(bg_bias_ema + bg_bias_step)
+                bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)
+            ema_w = 0.05 if raw_fg_ratio.item() > 0.50 else 0.005
+            bg_bias_ema = bg_bias_ema + ema_w * bg_bias_step
 
-            bg_bias_ema = bg_bias_ema.clamp(0.0, 2.5)
+            bg_bias_ema = bg_bias_ema.clamp(0.0, 5.0)
+            with torch.no_grad():
+                pre_fg = (semantic_logits.argmax(1) > 0).float().mean()
             semantic_logits[:, 0:1] += bg_bias_ema
 
             # ----------------------------
@@ -287,16 +290,17 @@ def trainer_synapse(args, model, snapshot_path):
             )
             if iter_num % 100 == 0:
                 with torch.no_grad():
-                    bg = semantic_logits[:,0]                      # (B,H,W)
-                    fg = semantic_logits[:,1:].amax(dim=1)         # (B,H,W) max-fg
-
+                    bg = semantic_logits[:, 0]                 # bias 後
+                    fg = semantic_logits[:, 1:].amax(dim=1)    # bias 後
                     x1 = fg - bg
-                    print(f"[raw argmax fg%] {(semantic_logits.argmax(1)>0).float().mean().item():.4f}")
+
+                    post_fg = (semantic_logits.argmax(1) > 0).float().mean()
+
+                    print(f"[fg%] pre={pre_fg.item():.4f} post={post_fg.item():.4f}")
                     print(f"[bg] mean={bg.mean().item():.3f} min={bg.min().item():.3f} max={bg.max().item():.3f}")
                     print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
                     print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
-                    print(f"[bg_bias_ema] {float(bg_bias_ema.item()):.3f}") 
-                    print(f"[bg_bias_ema={bg_bias_ema.item():.3f}]")
+                    print(f"[controller] raw_fg={raw_fg_ratio.item():.4f} step={bg_bias_step.item():+.4f} bg_bias_ema={bg_bias_ema.item():.3f}")
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
@@ -376,11 +380,12 @@ def trainer_synapse(args, model, snapshot_path):
             bg_l = semantic_logits2[:, 0]           # (B,H,W)
             fg_l = semantic_logits2[:, 1:].amax(dim=1)   # (B,H,W)
             margin = 0.5
+            '''
             viol = margin + fg_l - bg_l             # (B,H,W)
 
             loss_fgcap = F.relu(viol).mean()
             loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
-
+            '''
             
             # ----------------------------
             # Dice (輔助，弱化)
@@ -495,10 +500,10 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_area * area_pen +
                 lambda_ovlp * overlap_pen +
                 lambda_cls_div * loss_cls_div +
-                lambda_bg * loss_bg +
+                #lambda_bg * loss_bg +
                 lambda_pix_div * loss_pix_div +
-                lambda_pseudo * loss_pseudo +
-                lambda_fgcap * loss_fgcap
+                lambda_pseudo * loss_pseudo
+                #lambda_fgcap * loss_fgcap
             )
 
             # ----------------------------
