@@ -241,7 +241,7 @@ def trainer_synapse(args, model, snapshot_path):
             gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
 
             semantic_logits2 = semantic_logits.clone()
-            beta = 4.0  # 起手 3~6；你目前全前景，建議先 4
+            beta = 10.0  # 起手 3~6；你目前全前景，建議先 4
             semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + beta * torch.log(1.0 - gate)
             semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + beta * torch.log(gate)
 
