@@ -239,32 +239,33 @@ def trainer_synapse(args, model, snapshot_path):
             # ----------------------------
             # Stage1 logits for FG vs BG (先算出 diff，controller 也用它)
             # ----------------------------
+            '''
             bg_logit = semantic_logits[:, 0:1]                 # (B,1,H,W)
             fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
             diff = fg_logit - bg_logit                         # fg - bg, >0 表示 fg 贏
-
+            '''
             # ----------------------------
             # BG bias controller (用 diff 做回授，不用 argmax fg%)
             # 目標：讓 diff 的高分位數 <= 0（代表大多數像素 BG 不輸）
             # ----------------------------
-
+            semantic_logits_raw = semantic_logits
             # init EMA
             if bg_bias_ema is None:
                 bg_bias_ema = torch.tensor(0.0, device=semantic_logits.device)
 
             # --- fg% BEFORE bias (log only) ---
             with torch.no_grad():
-                fg_before = (semantic_logits.argmax(1) > 0).float().mean()
+                fg_before = (semantic_logits_raw.argmax(1) > 0).float().mean()
 
             # --- apply current bias (non-inplace) ---
-            bg_mean_before = semantic_logits[:, 0].mean()
-            bg0 = semantic_logits[:, 0:1] + bg_bias_ema
-            semantic_logits = torch.cat([bg0, semantic_logits[:, 1:]], dim=1)
-            bg_mean_after = semantic_logits[:, 0].mean()
+            bg_mean_before = semantic_logits_raw[:, 0].mean()
+            bg0 = semantic_logits_raw[:, 0:1] + bg_bias_ema
+            semantic_logits_cal = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
+            bg_mean_after = semantic_logits_cal[:, 0].mean()
 
             # --- fg% AFTER bias (feedback) ---
             with torch.no_grad():
-                fg_after = (semantic_logits.argmax(1) > 0).float().mean()
+                fg_after = (semantic_logits_cal.argmax(1) > 0).float().mean()
 
             # --- deadband controller ---
             lo, hi = 0.05, 0.25
@@ -298,15 +299,16 @@ def trainer_synapse(args, model, snapshot_path):
                     f"bg_delta={(bg_mean_after - bg_mean_before).item():+.3f} "
                     f"fg% {fg_before.item():.4f}->{fg_after.item():.4f}"
                 )
+            semantic_logits2 = semantic_logits_cal
             # ----------------------------
             # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
             # ----------------------------
-            '''
-            bg_logit = semantic_logits[:, 0:1]                      # (B,1,H,W)
-            fg_logit = semantic_logits[:, 1:].amax(1, True)   # 取 max，和 argmax 競爭一致
+            
+            bg_logit = semantic_logits_raw[:, 0:1]                      # (B,1,H,W)
+            fg_logit = semantic_logits_raw[:, 1:].amax(1, True)   # 取 max，和 argmax 競爭一致
 
             diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
-            '''
+            
             
             
             with torch.no_grad():
@@ -379,7 +381,7 @@ def trainer_synapse(args, model, snapshot_path):
             semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
             #semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
             '''
-            semantic_logits2 = semantic_logits  
+            #semantic_logits2 = semantic_logits  
             gt_fg = (label_ce > 0)            # (B,H,W) bool
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
 
