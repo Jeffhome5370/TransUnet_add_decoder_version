@@ -32,6 +32,15 @@ GLOBAL_WORKER_SEED = 1234
 def worker_init_fn(worker_id):
     random.seed(GLOBAL_WORKER_SEED + worker_id)
 
+def focal_bce_with_logits(logits, targets, alpha=0.75, gamma=2.0):
+    # logits/targets: (B,1,H,W)
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p = torch.sigmoid(logits)
+    pt = p * targets + (1 - p) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = alpha_t * (1 - pt).pow(gamma) * bce
+    return loss.mean()
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
 
@@ -139,7 +148,7 @@ def trainer_synapse(args, model, snapshot_path):
     # ----------------------------
     # Stage1 scaling (先固定，避免你現在 /3 亂飄)
     # ----------------------------
-    fb_div = 3.0  # 你原本 /3，先保留；若仍敏感再做 scale-EMA
+    fb_div = 2.0  # 你原本 /3，先保留；若仍敏感再做 scale-EMA
 
     for epoch_num in iterator:
         model.train()
@@ -207,12 +216,7 @@ def trainer_synapse(args, model, snapshot_path):
                 # pos_weight：fg<1% 時 8 太小，改成 80 上限
                 pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=80.0)
 
-            loss_fg_bg = F.binary_cross_entropy_with_logits(
-                fb_logit,
-                gt_is_fg_soft,
-                pos_weight=pos_weight
-            )
-
+            loss_fg_bg = focal_bce_with_logits(fb_logit, gt_is_fg_soft, alpha=0.80, gamma=2.0)
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
@@ -293,6 +297,17 @@ def trainer_synapse(args, model, snapshot_path):
 
             lambda_cls = 0.2 if explore_mode else 1.0
 
+            # ===== class anti-collapse regularizer (batch-level) =====
+            # q_cls_prob: (B,Q,C)
+            q_cls_prob = torch.softmax(class_logits, dim=-1)
+
+            # 只看前景類別 1..C-1（不含 BG）
+            p_cls = q_cls_prob[..., 1:].mean(dim=(0,1))              # (C-1,)
+            p_cls = p_cls / p_cls.sum().clamp_min(1e-6)
+
+            u = torch.full_like(p_cls, 1.0 / p_cls.numel())
+            loss_cls_div = torch.sum(p_cls * (p_cls.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
+            lambda_cls_div = 2e-3
             # ----------------------------
             # Total loss (止血版，不互打)
             # ----------------------------
@@ -302,7 +317,8 @@ def trainer_synapse(args, model, snapshot_path):
                 lambda_dice * loss_dice +
                 lambda_cov  * loss_cov +
                 lambda_area * area_pen +
-                lambda_ovlp * overlap_pen
+                lambda_ovlp * overlap_pen +
+                lambda_cls_div * loss_cls_div
             )
 
             # ----------------------------
@@ -350,7 +366,12 @@ def trainer_synapse(args, model, snapshot_path):
                     FP_rate = FP / max(gt_bg_cnt, 1)
                     FN_rate = FN / max(gt_fg_cnt, 1)
 
+                    q_cls = torch.softmax(class_logits, dim=-1)          # (B,Q,C)
+                    p_cls_dbg = q_cls[..., 1:].mean(dim=(0, 1))          # (C-1,)
+                    p_cls_dbg = p_cls_dbg / p_cls_dbg.sum().clamp_min(1e-6)
+                    
                     print("===== DEBUG (Conservative GT-fg Stage2 + Stop-bleeding losses) =====")
+                    print("[class_head p_cls]", p_cls_dbg.detach().cpu().numpy().round(3))
                     print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio(argmax): {pred_fg_ratio:.4f} | Stage1_fg_ratio: {stage1_fg_ratio:.4f}")
                     print(f"pred_unique: {pred_unique}")
                     print(f"[FG hist] dom_cls={fg_dom_cls}, dom_ratio={fg_dom_ratio:.3f}")
