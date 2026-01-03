@@ -44,6 +44,13 @@ def focal_bce_with_logits(logits, targets, alpha=0.80, gamma=2.0, pos_weight=Non
     loss = alpha_t * (1 - pt).pow(gamma) * bce
     return loss.mean()
 
+# ---- helper: q80 function ----
+def q80(x_flat: torch.Tensor) -> torch.Tensor:
+    n = x_flat.numel()
+    k = int(0.80 * n)
+    k = max(0, min(n - 1, k))
+    return x_flat.kthvalue(k + 1).values  # 1-based
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
 
@@ -227,33 +234,65 @@ def trainer_synapse(args, model, snapshot_path):
             semantic_prob = semantic_prob.clamp(1e-6, 1-1e-6)
             semantic_logits = torch.log(semantic_prob)    
             # ---- multi-class extreme-value correction ----
-            with torch.no_grad():
-                raw_fg_ratio = (semantic_logits.argmax(1) > 0).float().mean()
+            # ----------------------------
+            # Stage1 logits for FG vs BG (先算出 diff，controller 也用它)
+            # ----------------------------
+            bg_logit = semantic_logits[:, 0:1]                 # (B,1,H,W)
+            fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
+            diff = fg_logit - bg_logit                         # fg - bg, >0 表示 fg 贏
 
-            # target fg% ~ 0.12 (可改 0.10~0.15)
-            target = 0.12
-            k = 2.0  # gain
-            bg_bias_step = (raw_fg_ratio - target) * k        # fg 太高 -> bg_bias_step > 0 -> 抬 BG
-            bg_bias_step = bg_bias_step.clamp(-0.30, 0.30)
+            # ----------------------------
+            # BG bias controller (用 diff 做回授，不用 argmax fg%)
+            # 目標：讓 diff 的高分位數 <= 0（代表大多數像素 BG 不輸）
+            # ----------------------------
 
+            # init EMA
             if bg_bias_ema is None:
-                bg_bias_ema = torch.tensor(0.8, device=semantic_logits.device)
-            ema_w = 0.05 if raw_fg_ratio.item() > 0.50 else 0.005
-            bg_bias_ema = bg_bias_ema + ema_w * bg_bias_step
+                bg_bias_ema = torch.tensor(0.0, device=semantic_logits.device)
 
-            bg_bias_ema = bg_bias_ema.clamp(0.0, 5.0)
+            # --- fg% BEFORE bias (log only) ---
             with torch.no_grad():
-                pre_fg = (semantic_logits.argmax(1) > 0).float().mean()
-            semantic_logits[:, 0:1] += bg_bias_ema
+                fg_before = (semantic_logits.argmax(1) > 0).float().mean()
 
+            # --- apply current bias (non-inplace) ---
+            bg_mean_before = semantic_logits[:, 0].mean()
+            bg0 = semantic_logits[:, 0:1] + bg_bias_ema
+            semantic_logits = torch.cat([bg0, semantic_logits[:, 1:]], dim=1)
+            bg_mean_after = semantic_logits[:, 0].mean()
+
+            # --- fg% AFTER bias (feedback) ---
+            with torch.no_grad():
+                fg_after = (semantic_logits.argmax(1) > 0).float().mean()
+
+            # --- controller update (use fg_after) ---
+            target_fg = 0.12
+            gain = 1.0                     # 0.6~1.5 可調；先用 1.0
+            step = (fg_after - target_fg) * gain
+            step = step.clamp(-0.10, 0.10) # 每步最多動 0.10，避免暴衝
+
+            # faster when very wrong
+            ema_w = 0.05 if fg_after.item() > 0.50 else 0.01
+
+            # fg 太高 -> step>0 -> 增加 bg_bias
+            # fg 太低 -> step<0 -> 減少 bg_bias
+            bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(0.0, 2.5)
+
+            # --- logging ---
+            if iter_num % 100 == 0:
+                print(
+                    f"[bias_fg] step={step.item():+.3f} bg_bias_ema={bg_bias_ema.item():.3f} "
+                    f"bg_delta={(bg_mean_after - bg_mean_before).item():+.3f} "
+                    f"fg% {fg_before.item():.4f}->{fg_after.item():.4f}"
+                )
             # ----------------------------
             # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
             # ----------------------------
+            '''
             bg_logit = semantic_logits[:, 0:1]                      # (B,1,H,W)
             fg_logit = semantic_logits[:, 1:].amax(1, True)   # 取 max，和 argmax 競爭一致
 
             diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
-
+            '''
             
             
             with torch.no_grad():
@@ -288,6 +327,7 @@ def trainer_synapse(args, model, snapshot_path):
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit, gt_is_fg, pos_weight=pos_weight
             )
+            '''
             if iter_num % 100 == 0:
                 with torch.no_grad():
                     bg = semantic_logits[:, 0]                 # bias 後
@@ -301,6 +341,7 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
                     print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
                     print(f"[controller] raw_fg={raw_fg_ratio.item():.4f} step={bg_bias_step.item():+.4f} bg_bias_ema={bg_bias_ema.item():.3f}")
+            '''
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
@@ -576,10 +617,10 @@ def trainer_synapse(args, model, snapshot_path):
                     print(f"[area] area_pen={area_pen.item():.4f} | weighted={lambda_area * area_pen.item():.6f}")
                     print(f"[overlap_pen] overlap_pen={overlap_pen.item():.4f} | weighted={lambda_ovlp * overlap_pen.item():.6f}")
                     print(f"[cls_div] loss_cls_div={loss_cls_div.item():.4f} | weighted={lambda_cls_div*loss_cls_div.item():.6f}")
-                    print(f"[bg] loss_bg={loss_bg.item():.4f} | weighted={lambda_bg * loss_bg.item():.6f}")
+                    #print(f"[bg] loss_bg={loss_bg.item():.4f} | weighted={lambda_bg * loss_bg.item():.6f}")
                     print(f"[pix_div] loss_pix_div={loss_pix_div.item():.4f} | weighted={lambda_pix_div * loss_pix_div.item():.6f}")
                     print(f"[pseudo] loss_pseudo={loss_pseudo.item():.4f} | weighted={lambda_pseudo * loss_pseudo.item():.6f}")
-                    print(f"[fgcap] loss_fgcap ={loss_fgcap .item():.4f} | weighted={lambda_fgcap * loss_fgcap.item():.6f}")       
+                    #print(f"[fgcap] loss_fgcap ={loss_fgcap .item():.4f} | weighted={lambda_fgcap * loss_fgcap.item():.6f}")       
                     
             # ----------------------------
             # backward / step
