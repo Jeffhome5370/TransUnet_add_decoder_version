@@ -314,7 +314,7 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
                 gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5) 
-                target_ratio = (gt_fg_ratio * 2.0).clamp(0.005, 0.12)    
+                target_ratio = (gt_fg_ratio * 1.5).clamp(0.003, 0.06)    
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
                 flat = diff.detach().flatten()
@@ -327,7 +327,8 @@ def trainer_synapse(args, model, snapshot_path):
                 tau_ema = tau_batch
             else:
                 if iter_num % 10 == 0:
-                    tau_ema = tau_batch if tau_ema is None else 0.98 * tau_ema + 0.02 * tau_batch
+                    w_tau = 0.05 if stage1_fg_ratio_ema is not None and stage1_fg_ratio_ema > 0.25 else 0.02
+                    tau_ema = (1 - w_tau) * tau_ema + w_tau * tau_batch
                 #tau_ema = 0.9 * tau_ema + 0.1 * tau_batch
 
             tau = tau_ema
