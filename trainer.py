@@ -241,8 +241,9 @@ def trainer_synapse(args, model, snapshot_path):
             gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
 
             semantic_logits2 = semantic_logits.clone()
-            semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + torch.log(1.0 - gate)  # BG
-            semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + torch.log(gate)  
+            beta = 4.0  # 起手 3~6；你目前全前景，建議先 4
+            semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + beta * torch.log(1.0 - gate)
+            semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + beta * torch.log(gate)
 
 
             gt_fg = (label_ce > 0)            # (B,H,W) bool
@@ -268,15 +269,15 @@ def trainer_synapse(args, model, snapshot_path):
 
             # ---- BG-only CE on GT background (small weight) ----
             gt_bg = (label_ce == 0)  # (B,H,W)
-            loss_bg = torch.tensor(0.0, device=label_ce.device)
-            if gt_bg.any():
-                # 只在 GT 背景像素上，讓 BG logit 要大於 FG
-                # 用 full CE 最簡單（target=0）
-                loss_bg = F.cross_entropy(
-                    semantic_logits2.permute(0,2,3,1)[gt_bg],  # (N_bg, 9)
-                    label_ce[gt_bg]                            # all zeros
-                )
-            lambda_bg = 0.05 
+            # 在 GT bg 上：希望 bg_logit >= max_fg_logit + margin
+            bg_l = semantic_logits2[:, 0:1]                    # (B,1,H,W)
+            fg_l = semantic_logits2[:, 1:].amax(dim=1, keepdim=True)  # (B,1,H,W)
+
+            margin = 1.0
+            viol = (margin + fg_l - bg_l)  # >0 表示背景被前景壓過
+            loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
+            
+            lambda_bg = 0.01 
             # ----------------------------
             # Dice (輔助，弱化)
             # ----------------------------
