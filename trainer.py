@@ -205,7 +205,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 4.0).clamp(0.02, 0.30)
+                target_ratio = (gt_fg_ratio * 2.5).clamp(0.05, 0.25)
 
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
@@ -213,11 +213,17 @@ def trainer_synapse(args, model, snapshot_path):
                 N = flat.numel()
                 k = int((1.0 - float(target_ratio.item())) * N)
                 k = max(0, min(N - 1, k))
-                tau = flat.kthvalue(k + 1).values   # kthvalue 是 1-based
+                #tau = flat.kthvalue(k + 1).values   # kthvalue 是 1-based
+                tau_batch = flat.kthvalue(k + 1).values
+            if tau_ema is None:
+                tau_ema = tau_batch
+            else:
+                tau_ema = 0.9 * tau_ema + 0.1 * tau_batch
 
+            tau = tau_ema.detach()
+            fb_logit = (diff - tau).clamp(-12, 12)
             # 把 tau 當成 bias：fb_logit = diff - tau
             # 注意：tau detached，所以不會反傳梯度造成奇怪震盪
-            fb_logit = (diff - tau).clamp(-12, 12)  # 可選：避免爆尺度
 
             # pos_weight（你原本那套保留，但上限 80 比較合理）
             with torch.no_grad():
@@ -234,7 +240,11 @@ def trainer_synapse(args, model, snapshot_path):
             gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
 
             semantic_logits2 = semantic_logits.clone()
-            beta = 10.0  # 起手 3~6；你目前全前景，建議先 4
+            with torch.no_grad():
+                dm = diff.mean().abs().item()
+
+            beta = float(np.clip(dm * 2.0, 2.0, 8.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
+
             semantic_logits2[:, 0:1]  = semantic_logits2[:, 0:1]  + beta * torch.log(1.0 - gate)
             semantic_logits2[:, 1:  ] = semantic_logits2[:, 1:  ] + beta * torch.log(gate)
 
