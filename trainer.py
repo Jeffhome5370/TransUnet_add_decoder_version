@@ -203,20 +203,14 @@ def trainer_synapse(args, model, snapshot_path):
             fb_logit = (fg_logit - bg_logit) / fb_div               # (B,1,H,W)
 
             with torch.no_grad():
-                gt_is_fg_hard = (label_ce > 0).float().unsqueeze(1)  # (B,1,H,W)
-                # soft/smoothed target (更穩)
-                gt_is_fg_soft = F.avg_pool2d(
-                    gt_is_fg_hard,
-                    kernel_size=7,
-                    stride=1,
-                    padding=3
-                )
-
-                fg_frac = gt_is_fg_hard.mean().clamp_min(1e-4)  # fg 很小時別卡死
-                # pos_weight：fg<1% 時 8 太小，改成 80 上限
+                gt_is_fg = (label_ce > 0).float().unsqueeze(1)
+                fg_frac = gt_is_fg.mean().clamp_min(1e-4)
                 pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=80.0)
 
-            loss_fg_bg = focal_bce_with_logits(fb_logit, gt_is_fg_soft, alpha=0.80, gamma=2.0)
+            fb_logit_adj = fb_logit - 0.5
+            loss_fg_bg = focal_bce_with_logits(
+                fb_logit_adj, gt_is_fg, alpha=0.80, gamma=2.0, pos_weight=pos_weight
+            )
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
