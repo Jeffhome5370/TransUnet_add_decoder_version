@@ -32,9 +32,12 @@ GLOBAL_WORKER_SEED = 1234
 def worker_init_fn(worker_id):
     random.seed(GLOBAL_WORKER_SEED + worker_id)
 
-def focal_bce_with_logits(logits, targets, alpha=0.75, gamma=2.0):
+def focal_bce_with_logits(logits, targets, alpha=0.80, gamma=2.0, pos_weight=None):
     # logits/targets: (B,1,H,W)
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    # 先用帶 pos_weight 的 BCE，再套 focal
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction='none', pos_weight=pos_weight
+    )
     p = torch.sigmoid(logits)
     pt = p * targets + (1 - p) * (1 - targets)
     alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
