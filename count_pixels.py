@@ -1,6 +1,17 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+'''
+輸出結果
+===== Pixel Counts / Ratios =====
+Total pixels: 463732736
+class  0: count=   443106950 | ratio=0.95552224
+class  1: count=      729993 | ratio=0.00157417
+class  2: count=      187946 | ratio=0.00040529
+class  3: count=     1061963 | ratio=0.00229003
+class  4: count=     1064177 | ratio=0.00229481
+class  5: count=    11575064 | ratio=0.02496064
+class  6: count=      539063 | ratio=0.00116244
+class  7: count=     2604912 | ratio=0.00561727
+class  8: count=     2862668 | ratio=0.00617310
+'''
 import argparse
 import torch
 from torch.utils.data import DataLoader

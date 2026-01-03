@@ -205,7 +205,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 2.5).clamp(0.05, 0.25)
+                target_ratio = (gt_fg_ratio * 2.5).clamp(0.08, 0.25)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
 
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
@@ -255,19 +255,17 @@ def trainer_synapse(args, model, snapshot_path):
             if gt_fg.any():
                 fg_logits = semantic_logits2[:, 1:]  # (B,8,H,W)
 
-                # fg-only class weights (batch-wise, sqrt inverse, clamp)
-                with torch.no_grad():
-                    fg_lbl = label_ce[gt_fg]  # values in 1..8
-                    counts = torch.bincount(fg_lbl, minlength=num_classes).float()  # 0..8
-                    freq = counts[1:]  # (8,)
-                    freq = freq / freq.sum().clamp_min(1.0)
-                    w = (1.0 / torch.sqrt(freq + 1e-6)).clamp(0.5, 5.0)  # (8,)
-                    w = w / w.mean().clamp_min(1e-6)
+                y = (label_ce[gt_fg] - 1).long()     # (N_fg,)
+                # batch-level class counts
+                counts = torch.bincount(y, minlength=8).float()  # (8,)
+                w = (counts.sum() / (counts + 1.0)).clamp(1.0, 8.0)  # 反比權重，避免爆
+                # normalize to keep scale stable
+                w = w / w.mean().clamp_min(1e-6)
 
                 loss_fg_cls = F.cross_entropy(
-                    fg_logits.permute(0, 2, 3, 1)[gt_fg],        # (N_fg, 8)
-                    (label_ce[gt_fg] - 1).long(),                # 0..7
-                    weight=w
+                    fg_logits.permute(0,2,3,1)[gt_fg],  # (N_fg,8)
+                    y,
+                    weight=w.to(fg_logits.device)
                 )
 
             # ---- BG-only CE on GT background (small weight) ----
@@ -352,18 +350,17 @@ def trainer_synapse(args, model, snapshot_path):
             #============================================================
 
             # ---- pixel-level anti-collapse on predicted FG distribution ----
-            with torch.no_grad():
-                pred_fg = (label_ce > 0)  # 你也可以改成 pred_is_fg（Stage1 gate）做更強約束
+            gt_fg = (label_ce > 0)
 
-            pmap = semantic_prob[:, 1:]  # (B,8,H,W)
+            
             # 用 GT fg pixels 統計「模型預測的前景類別分布」
-            if pred_fg.any():
-                p_fg = pmap.permute(0,2,3,1)[pred_fg].mean(dim=0)  # (8,)
+            loss_pix_div = torch.tensor(0.0, device=semantic_prob.device)
+            if gt_fg.any():
+                pmap = semantic_prob[:, 1:]  # (B,8,H,W)
+                p_fg = pmap.permute(0,2,3,1)[gt_fg].mean(dim=0)  # (8,)
                 p_fg = p_fg / p_fg.sum().clamp_min(1e-6)
                 u = torch.full_like(p_fg, 1.0 / p_fg.numel())
                 loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
-            else:
-                loss_pix_div = torch.tensor(0.0, device=semantic_prob.device)
             
             #============================================================
 
@@ -382,7 +379,7 @@ def trainer_synapse(args, model, snapshot_path):
             lambda_ovlp = 1e-2       # overlap penalty (門檻提高後再給小權重)
             lambda_cls_div = 1e-2
             lambda_bg = 0.01
-            lambda_pix_div = 1e-2
+            lambda_pix_div = 2e-2
             
             loss = (
                 lambda_fb   * loss_fg_bg +
