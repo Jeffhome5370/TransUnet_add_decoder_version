@@ -145,7 +145,7 @@ def trainer_synapse(args, model, snapshot_path):
     # Stage1 scaling (先固定，避免你現在 /3 亂飄)
     # ----------------------------
     fb_div = 2.0  # 你原本 /3，先保留；若仍敏感再做 scale-EMA
-
+    tau_ema = None
     for epoch_num in iterator:
         model.train()
 
