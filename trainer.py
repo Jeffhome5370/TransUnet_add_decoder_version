@@ -204,7 +204,7 @@ def trainer_synapse(args, model, snapshot_path):
             with torch.no_grad():
                 gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
                 gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5) 
-                target_ratio = (gt_fg_ratio * 2.0).clamp(0.03, 0.12)    
+                target_ratio = (gt_fg_ratio * 2.0).clamp(0.005, 0.12)    
                 # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
                 # pred_is_fg = diff > tau
                 flat = diff.detach().flatten()
@@ -237,20 +237,22 @@ def trainer_synapse(args, model, snapshot_path):
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
             # ---- fuse Stage1 gate into semantic logits (log-prior) ----
-            p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
-            prior = (0.5 - p_fg)                      # in [-0.5, 0.5]
-            prior = prior.clamp(-2.0, 2.0)   # 先止血，別讓 prior 太極端
+            #p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
+            prior = torch.tanh((-diff) / 2.0)                      # in [-0.5, 0.5]
+            
             #gate = torch.sigmoid(fb_logit).clamp(1e-4, 1 - 1e-4)  # (B,1,H,W)
             
             
             with torch.no_grad():
                 dm = diff.mean().abs().item()
-            fg_region = (diff > tau).float()  # (B,1,H,W)
             beta = float(np.clip(dm * 2.0, 1.0, 3.0))  # dm=0.6 -> beta~2, dm=1.7 -> beta~3.4
+            fg_region = (diff > tau).float()  # (B,1,H,W)
+            delta = beta * prior * fg_region
+            delta = delta.clamp(-0.5, 0.5)
 
             semantic_logits2 = semantic_logits.clone()
-            semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + beta * prior
-            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - fg_region * (beta * prior) 
+            semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
+            semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
 
 
             gt_fg = (label_ce > 0)            # (B,H,W) bool
@@ -297,7 +299,7 @@ def trainer_synapse(args, model, snapshot_path):
 
                 # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
                 # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 2.0).clamp(0.03, 0.12)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
+                target_ratio = (gt_fg_ratio * 2.0).clamp(0.005, 0.12)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
                 target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
             
             #pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
@@ -400,9 +402,12 @@ def trainer_synapse(args, model, snapshot_path):
 
             with torch.no_grad():
                 if pred_fg_ratio > 0.7:
-                    print("[prior] mean/min/max:",
-                        float(prior.mean()), float(prior.min()), float(prior.max()))
-            
+                    with torch.no_grad():
+                        print(f"[fg_region] mean={fg_region.mean().item():.4f}")
+                        print(f"[diff] mean/min/max={diff.mean().item():.4f} / {diff.min().item():.4f} / {diff.max().item():.4f}")
+                        print(f"[prior] mean/min/max={prior.mean().item():.4f} / {prior.min().item():.4f} / {prior.max().item():.4f}")
+                        print(f"[delta] beta={beta:.3f} mean/min/max="
+                            f"{delta.mean().item():.4f} / {delta.min().item():.4f} / {delta.max().item():.4f}")
 
             # ----------------------------
             # LOSS weights 
