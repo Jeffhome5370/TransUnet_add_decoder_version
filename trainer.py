@@ -190,7 +190,11 @@ def trainer_synapse(args, model, snapshot_path):
             den_raw = mask_probs.sum(dim=1)                 # (B,H,W)
             den = den_raw.clamp_min(0.2)                    # safe for division
             semantic_logits = semantic_logits / den.unsqueeze(1)
-
+            
+            # ---- multi-class extreme-value correction ----
+            BG_BIAS = 2.0  # 先從 2.0 起跳很合理（8類max偏差量級）
+            semantic_logits[:, 0:1] += BG_BIAS
+            
             # ----------------------------
             # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
             # ----------------------------
@@ -233,11 +237,22 @@ def trainer_synapse(args, model, snapshot_path):
             loss_fg_bg = F.binary_cross_entropy_with_logits(
                 fb_logit, gt_is_fg, pos_weight=pos_weight
             )
+            if iter_num % 100 == 0:
+                with torch.no_grad():
+                    bg = semantic_logits[:,0]                      # (B,H,W)
+                    fg = semantic_logits[:,1:].amax(dim=1)         # (B,H,W) max-fg
+
+                    x1 = fg - bg
+                    print(f"[raw argmax fg%] {(semantic_logits.argmax(1)>0).float().mean().item():.4f}")
+                    print(f"[bg] mean={bg.mean().item():.3f} min={bg.min().item():.3f} max={bg.max().item():.3f}")
+                    print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
+                    print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
             # ----------------------------
             # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
             # ----------------------------
             # ---- fuse Stage1 gate into semantic logits (log-prior) ----
             #p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
+            '''
             prior = torch.tanh((-diff) / 2.0)                      # in [-0.5, 0.5]
             with torch.no_grad():
                 dm = diff.mean().abs().item()
@@ -247,13 +262,15 @@ def trainer_synapse(args, model, snapshot_path):
             s = 0.5  # 0.3~1.0 之間都可
             w = torch.exp(-(diff - tau ).clamp(min=0.0) / s)  # diff 越高，推力越小
             delta = beta * prior * fg_region * w
-            delta = delta.clamp(-0.15, 0.15)
+            delta = delta.clamp(-0.0, 0.15)
             
+            
+
             semantic_logits2 = semantic_logits.clone()
             semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
             #semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
-
-
+            '''
+            semantic_logits2 = semantic_logits  
             gt_fg = (label_ce > 0)            # (B,H,W) bool
             loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
 
