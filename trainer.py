@@ -127,12 +127,13 @@ class PhaseScheduler:
             w["pix_div"] = 2e-2
         elif ph == 3:
             # 最後才加分散/去塌陷
+            w["cls"]     = 0.7
             w["dice"]    = 0.20
-            w["area"]    = 2e-3
-            w["ovlp"]    = 1e-2
-            w["cls_div"] = 1e-2
-            w["pix_div"] = 2e-2
-            w["q_div"]   = 5e-4
+            w["area"]    = 1e-3
+            w["ovlp"]    = 2e-3
+            w["cls_div"] = 5e-3
+            w["pix_div"] = 1e-2
+            w["q_div"]   = 1e-4  
             
         else:
             # 最後才加pseudo
@@ -446,7 +447,9 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                        trainable_params,
                        epoch_num,
                        image_batch,
-                       label_batch):
+                       label_batch,
+                       class_usage_ema,
+                       class_usage_mom):
     """
     你在 trainer_synapse 裡每個 batch 呼叫一次即可。
     回傳更新後狀態：iter_num, tau_ema_state, cls_count_ema
@@ -482,6 +485,27 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # compute pred stats (after bias)
     pred, pred_fg_ratio, gt_fg_ratio, pred_unique = compute_pred_stats(semantic_logits2, label_ce)
     dom_cls, dom_ratio = fg_hist_dom(pred, args.num_classes)
+
+    # semantic prediction
+    #pred_cls = semantic_logits2.argmax(1) == pred           # (B,H,W)
+    pred_fg_mask = (pred > 0)
+
+    # 更新 class usage EMA
+    class_usage_ema = update_class_usage_ema(
+        class_usage_ema,
+        pred,
+        pred_fg_mask,
+        mom=class_usage_mom
+    )
+
+    # 計算 num_fg_classes
+    num_fg_classes, class_usage_snapshot = compute_num_fg_classes(
+        class_usage_ema,
+        min_ratio=0.005
+    )
+
+
+
 
     # -------------------------
     # Phase weights
@@ -530,9 +554,22 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     loss_ovlp = reg_overlap_pen(mask_probs, den_raw, thr=2.0) if w["ovlp"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_cls_div = reg_cls_div(class_logits) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_pix_div = reg_pix_div(semantic_logits2, label_ce, fb_logit) if w["pix_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    if ph == 3:
+        enable_q_div = gate_q_div(
+            num_fg_classes=num_fg_classes,
+            dom_ratio=dom_ratio,
+            q10_ema=float(q10_ema.item()) if q10_ema is not None else 0.0
+        )
+        if not enable_q_div:
+            w["q_div"] = 0.0
+
+        if pred_fg_ratio < 0.05:
+            w["cls_div"] = 0.0
+            w["pix_div"] = 0.0
+            w["q_div"] = 0.0
     loss_q_div = reg_q_div(class_logits, margin=0.9) if w["q_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
 
-    # pseudo（Phase3 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
+    # pseudo（Phase4 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
     loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
 
     # -------------------------
@@ -587,7 +624,10 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
             print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f} | q_div={loss_q_div.item():.6f}")
         if ph == 4:
             print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f} | q_div={loss_q_div.item():.6f} | pseudo={loss_pseudo.item():.6f}")
-        
+        print("=======check 每個 class 分配能量=======")
+        print(f"[FG CLASS STATE] num_fg_classes={num_fg_classes}")
+        for c in range(1, args.num_classes):
+            print(f"  class {c}: ema_ratio={class_usage_snapshot[c]:.4f}")
         
         
     # tensorboard
@@ -652,7 +692,72 @@ def _maybe_skip_slice(label_ce: torch.Tensor, bg_keep_prob: float, min_fg_ratio:
 
     return False
 
+@torch.no_grad()
+def update_class_usage_ema(
+    class_usage_ema,
+    pred,          # (B,H,W) semantic argmax
+    pred_fg_mask,      # (B,H,W) bool
+    mom=0.95
+):
+    """
+    使用 prediction（不是 GT）更新 class 使用率 EMA
+    """
+    fg_pixels = pred[pred_fg_mask]
 
+    if fg_pixels.numel() == 0:
+        return class_usage_ema
+
+    counts = torch.bincount(
+        fg_pixels,
+        minlength=class_usage_ema.numel()
+    ).float()
+
+    counts[0] = 0.0  # 排除 background
+
+    ratios = counts / counts.sum().clamp_min(1e-6)
+    class_usage_ema = mom * class_usage_ema + (1 - mom) * ratios
+    return class_usage_ema
+
+@torch.no_grad()
+def compute_num_fg_classes(
+    class_usage_ema,
+    min_ratio=0.005,      # 0.5%（保留 Gallbladder）
+    max_ratio=0.90        # 防止單一器官壟斷
+):
+    """
+    根據 EMA 判斷「穩定存在的前景類別數」
+    """
+    valid = (
+        (class_usage_ema > min_ratio) &
+        (class_usage_ema < max_ratio)
+    )
+
+    valid[0] = False  # background 不算
+    num_fg_classes = int(valid.sum().item())
+
+    return num_fg_classes, class_usage_ema.clone()
+
+def gate_q_div(
+    num_fg_classes,
+    dom_ratio,
+    q10_ema,
+    min_classes=4,        # Liver + Kidney + Pancreas + Gallbladder
+    max_dom_ratio=0.85,
+    q10_range=(-0.3, 0.3)
+):
+    """
+    判斷 Phase3 是否啟用 q_div
+    """
+    if num_fg_classes < min_classes:
+        return False
+
+    if dom_ratio > max_dom_ratio:
+        return False
+
+    if not (q10_range[0] <= q10_ema <= q10_range[1]):
+        return False
+
+    return True
 
 '''
 
@@ -987,7 +1092,7 @@ def trainer_synapse(args, model, snapshot_path):
 
     global GLOBAL_WORKER_SEED
     GLOBAL_WORKER_SEED = args.seed
-
+    
     logging.basicConfig(
         filename=os.path.join(snapshot_path, "log.txt"),
         level=logging.INFO,
@@ -1013,6 +1118,10 @@ def trainer_synapse(args, model, snapshot_path):
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
     max_epoch = args.max_epochs
+    device = "cuda"
+    class_usage_ema = torch.zeros(num_classes, device=device)
+    class_usage_mom = 0.95
+
 
     db_train = Synapse_dataset(
         base_dir=args.root_path,
@@ -1144,7 +1253,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ----------------------------
             # forward: model -> (class_logits, masks[-1]) -> mask_probs/den
             # ----------------------------
-            iter_num, tau_ema_state, cls_count_ema = training_step_core(
+            iter_num, tau_ema_state, cls_count_ema, class_usage_ema = training_step_core(
                 args, model, dice_loss, optimizer, writer, wandb,
                 class_labels,
                 iter_num,
@@ -1154,17 +1263,57 @@ def trainer_synapse(args, model, snapshot_path):
                 cls_count_ema,
                 trainable_params,
                 epoch_num,
-                image_batch, label_ce
+                image_batch, label_ce,
+                class_usage_ema = class_usage_ema,
+                class_usage_mom = class_usage_mom
             )
 
+        if epoch_num == p1_epochs - 1:
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),   # 可選
+                "iter": iter_num,
+                "epoch": epoch_num,
+
+                # ===== training state =====
+                "class_usage_ema": class_usage_ema,
+                "tau_ema": tau_ema_state,
+                "bg_bias": controller.bias,
+            }
+            save_mode_path = os.path.join(snapshot_path, 'phase1_epoch_' + str(epoch_num) + '.pth')
+            torch.save(ckpt, save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+
         if epoch_num == p2_epochs - 1:
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),   # 可選
+                "iter": iter_num,
+                "epoch": epoch_num,
+
+                # ===== training state =====
+                "class_usage_ema": class_usage_ema,
+                "tau_ema": tau_ema_state,
+                "bg_bias": controller.bias,
+            }
             save_mode_path = os.path.join(snapshot_path, 'phase2_epoch_' + str(epoch_num) + '.pth')
-            torch.save(model.state_dict(), save_mode_path)
+            torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
         
         if epoch_num == p3_epochs - 1:
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),   # 可選
+                "iter": iter_num,
+                "epoch": epoch_num,
+
+                # ===== training state =====
+                "class_usage_ema": class_usage_ema,
+                "tau_ema": tau_ema_state,
+                "bg_bias": controller.bias,
+            }
             save_mode_path = os.path.join(snapshot_path, 'phase3_epoch_' + str(epoch_num) + '.pth')
-            torch.save(model.state_dict(), save_mode_path)
+            torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
         # ================================
         # Validation Stage (保留你原本版本)
