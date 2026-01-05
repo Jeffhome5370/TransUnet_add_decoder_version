@@ -729,7 +729,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         )
 
     iter_num += 1
-    return iter_num, tau_ema_state, cls_count_ema
+    return iter_num, tau_ema_state, cls_count_ema, class_usage_ema
 
     #=======================================================================================
 
