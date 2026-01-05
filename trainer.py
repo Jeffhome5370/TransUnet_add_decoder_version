@@ -77,7 +77,7 @@ class PhaseScheduler:
     Phase 2: 加少量幾何正則（area/overlap 小權重）
     Phase 3: 再加 anti-collapse（cls_div / pix_div / q_div / pseudo）
     """
-    def __init__(self, p1_epochs=2, p2_epochs=10, p3_epochs=15):
+    def __init__(self, p1_epochs=2, p2_epochs=30, p3_epochs=50):
         self.p1_epochs = p1_epochs
         self.p2_epochs = p2_epochs
         self.p3_epochs = p3_epochs
@@ -121,8 +121,8 @@ class PhaseScheduler:
             # 輕量幾何（先寬鬆、權重小）
             w["cls"] = 0.7
             w["dice"] = 0.15
-            w["area"] = 2e-3
-            w["ovlp"] = 5e-3
+            w["area"] = 1e-3
+            w["ovlp"] = 2e-3
             w["cls_div"] = 2e-3
             w["pix_div"] = 2e-2
         elif ph == 3:
@@ -180,31 +180,48 @@ class BgBiasController:
         return torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
 
     @torch.no_grad()
-    def step_from_logits(self, semantic_logits_biased, pred_fg_ratio=None):
+    def step_from_logits(self, semantic_logits_biased, pred_fg_ratio=None, phase=None):
+        if phase == 2:
+            gain = 0.05
+            step_clip = 0.03
+            ema_w = 0.03
+            deadband = 0.08
+            q10_target = -0.15
+        else:
+            gain = self.gain
+            step_clip = self.step_clip
+            ema_w = self.ema_w
+            deadband = 0.03
+            q10_target = self.q10_target
         # margin = fg_max - bg
         bg = semantic_logits_biased[:, 0]
         fg = semantic_logits_biased[:, 1:].amax(dim=1)
         d = (fg - bg).flatten()
 
-        q10 = torch.quantile(d, 0.10)
         q10_now = torch.quantile(d, 0.10)
-        self.q10_ema = q10 if self.q10_ema is None else (0.95 * self.q10_ema + 0.05 * q10)
+        if self.q10_ema is None:
+            self.q10_ema = q10_now
+        else:
+            w = ema_w   # Phase2 = 0.03
+            self.q10_ema = (1 - w) * self.q10_ema + w * q10_now
 
         # ---- (A) 全背景保護：如果已經幾乎全背景，就快速釋放 bias ----
         if pred_fg_ratio is not None and pred_fg_ratio < 0.02:
+            release = 0.05 if phase == 2 else 0.20
             self.bias = (self.bias - 0.20).clamp(0.0, self.max_bias)   # release fast
-            return -0.20, float(self.q10_ema.item()), float(q10_now.item())
+            return -release, float(self.q10_ema.item()), float(q10_now.item())
 
         # ---- (B) deadband：在目標附近不動，降低震盪 ----
-        deadband = 0.03
-        err = float(self.q10_ema.item() - self.q10_target)
+        
+        
+        err = float(self.q10_ema.item() - q10_target)
         if abs(err) < deadband:
             self.bias = (self.bias * 0.999).clamp(0.0, self.max_bias)  # tiny decay
             return 0.0, float(self.q10_ema.item()), float(q10_now.item())
 
         # ---- (C) 非對稱步幅：釋放要比增加快（避免鎖死）----
-        step = err * self.gain
-        step = float(np.clip(step, -self.step_clip * 2.0, +self.step_clip))  # release 2x faster
+        step = err * gain
+        step = float(np.clip(step, -step_clip * 2.0, + step_clip))  # release 2x faster
         self.bias = (self.bias + step).clamp(0.0, self.max_bias)
         return step, float(self.q10_ema.item()), float(q10_now.item())
 
@@ -466,17 +483,19 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     pred, pred_fg_ratio, gt_fg_ratio, pred_unique = compute_pred_stats(semantic_logits2, label_ce)
     dom_cls, dom_ratio = fg_hist_dom(pred, args.num_classes)
 
+    # -------------------------
+    # Phase weights
+    # -------------------------
+    ph, w = phase_sched.weights(epoch_num)
+
     # controller step (extreme-only + cooldown)
-    delta, q10_ema, q10_now = controller.step_from_logits(semantic_logits2, pred_fg_ratio=pred_fg_ratio)
+    delta, q10_ema, q10_now = controller.step_from_logits(semantic_logits2, pred_fg_ratio=pred_fg_ratio, phase=ph)
 
     # NOTE: 你要讓「當次 loss」用更新後 bias 嗎？
     # 這裡採「下一 iter 生效」更穩（避免同 iter 震盪）
     # 如果你想當次生效，把上面 apply/compute 移到 step 後再 apply 一次。
 
-    # -------------------------
-    # Phase weights
-    # -------------------------
-    ph, w = phase_sched.weights(epoch_num)
+    
 
     # -------------------------
     # Stage1 loss (fg/bg)
@@ -562,9 +581,15 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         print(f"[loss] total={loss.item():.4f} | fg_bg={loss_fg_bg.item():.4f} | fg_cls={loss_fg_cls.item():.4f} | dice={loss_dice.item():.4f}")
         if ph >= 2:
             print(f"[reg] area={float(loss_area.item() if torch.is_tensor(loss_area) else loss_area):.6f} | ovlp={loss_ovlp.item():.6f}")
-        if ph >= 3:
+        if ph == 2:
+            print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f}")
+        if ph == 3:
             print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f} | q_div={loss_q_div.item():.6f}")
-
+        if ph == 4:
+            print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f} | q_div={loss_q_div.item():.6f} | pseudo={loss_pseudo.item():.6f}")
+        
+        
+        
     # tensorboard
     writer.add_scalar("train/phase", ph, iter_num)
     writer.add_scalar("train/loss_total", loss.item(), iter_num)
@@ -1082,8 +1107,10 @@ def trainer_synapse(args, model, snapshot_path):
     iter_num = 0
     best_performance = 0.0
 
-
-    phase_sched = PhaseScheduler(p1_epochs=2, p2_epochs=10, p3_epochs=15)
+    p1_epochs=2
+    p2_epochs=20
+    p3_epochs=50
+    phase_sched = PhaseScheduler(p1_epochs=p1_epochs, p2_epochs=p2_epochs, p3_epochs=p3_epochs)
     controller = BgBiasController(
         init_bias=0.0,
         max_bias=20.0,      # 先放大，因為你 margin 會到 +3，max_bias=2 根本不夠
@@ -1130,11 +1157,20 @@ def trainer_synapse(args, model, snapshot_path):
                 image_batch, label_ce
             )
 
+        if epoch_num == p2_epochs - 1:
+            save_mode_path = os.path.join(snapshot_path, 'phase2_epoch_' + str(epoch_num) + '.pth')
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+        
+        if epoch_num == p3_epochs - 1:
+            save_mode_path = os.path.join(snapshot_path, 'phase3_epoch_' + str(epoch_num) + '.pth')
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
         # ================================
         # Validation Stage (保留你原本版本)
         # ================================
 
-        if ((epoch_num+1) % 2 == 0 and epoch_num != 0):
+        if ((epoch_num+1) % 5 == 0 and epoch_num != 0):
             model.eval()
 
             dice_per_class = {c: [] for c in range(1, args.num_classes)}
