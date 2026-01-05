@@ -628,6 +628,70 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         print(f"[FG CLASS STATE] num_fg_classes={num_fg_classes}")
         for c in range(1, args.num_classes):
             print(f"  class {c}: ema_ratio={class_usage_snapshot[c]:.4f}")
+
+        logging.info("===== DEBUG (Phase Scheduler + Safe Controller) =====")
+        logging.info(f"[ITER] iter={iter_num} epoch={epoch_num}")
+
+        logging.info(
+            f"[PHASE] phase={ph} "
+            f"controller_delta={delta:+.3f} "
+            f"bias={float(controller.bias.item()):.3f} "
+            f"q10_now={q10_now:+.3f} "
+            f"q10_ema={q10_ema:+.3f}"
+        )
+
+        logging.info(
+            f"[FG_RATIO] GT_fg={gt_fg_ratio:.4f} "
+            f"Pred_fg(argmax)={pred_fg_ratio:.4f} "
+            f"Stage1_fg={stage1_fg_ratio:.4f}"
+        )
+
+        logging.info(f"[PRED] pred_unique={pred_unique[:20]}")
+        logging.info(f"[FG_HIST] dom_cls={dom_cls} dom_ratio={dom_ratio:.3f}")
+
+        logging.info(
+            f"[MARGIN] q01={q01:+.3f} q05={q05:+.3f} "
+            f"q10={q10:+.3f} q50={q50:+.3f} mean={m:+.3f}"
+        )
+
+        logging.info(
+            f"[LOSS] total={loss.item():.4f} "
+            f"fg_bg={loss_fg_bg.item():.4f} "
+            f"fg_cls={loss_fg_cls.item():.4f} "
+            f"dice={loss_dice.item():.4f}"
+        )
+
+        if ph >= 2:
+            logging.info(
+                f"[REG] area={float(loss_area.item() if torch.is_tensor(loss_area) else loss_area):.6f} "
+                f"ovlp={loss_ovlp.item():.6f}"
+            )
+
+        if ph == 2:
+            logging.info(
+                f"[DIV] cls_div={loss_cls_div.item():.6f} "
+                f"pix_div={loss_pix_div.item():.6f}"
+            )
+
+        if ph == 3:
+            logging.info(
+                f"[DIV] cls_div={loss_cls_div.item():.6f} "
+                f"pix_div={loss_pix_div.item():.6f} "
+                f"q_div={loss_q_div.item():.6f}"
+            )
+
+        if ph == 4:
+            logging.info(
+                f"[DIV] cls_div={loss_cls_div.item():.6f} "
+                f"pix_div={loss_pix_div.item():.6f} "
+                f"q_div={loss_q_div.item():.6f} "
+                f"pseudo={loss_pseudo.item():.6f}"
+            )
+
+        logging.info("======= CHECK FG CLASS ENERGY =======")
+        logging.info(f"[FG_CLASS_STATE] num_fg_classes={num_fg_classes}")
+        for c in range(1, args.num_classes):
+            logging.info(f"[FG_CLASS] class={c} ema_ratio={class_usage_snapshot[c]:.4f}")
         
         
     # tensorboard
