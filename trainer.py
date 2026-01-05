@@ -1,56 +1,962 @@
-# trainer.py (完整可直接替換你目前版本的 trainer_synapse 訓練段落 + 相關輔助)
-# - 保守版（穩）：Stage2 只用 GT fg，但加 fg-only class reweight
-# - 止血版 loss 組合：移除全圖 loss_den → 改 GT 前景上的 coverage loss_cov；overlap 門檻提高；area_pen 改成 >=0
-#
-# 你原本的其他功能（wandb、writer、視覺化、驗證流程）我都保留；
-# 只針對 forward->loss pipeline、explore_mode 的影響範圍、正則項作最少但關鍵的修改。
-
+# trainer.py (cleaned)
 import argparse
+import math
 import logging
 import os
 import random
 import sys
 import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from tensorboardX import SummaryWriter
-from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import wandb
-from utils import DiceLoss
 from torchvision import transforms
-import torch.nn.functional as F
+import wandb
+
+from utils import DiceLoss
 
 # ----------------------------
 # Global seed for dataloader workers
 # ----------------------------
 GLOBAL_WORKER_SEED = 1234
 
-def worker_init_fn(worker_id):
+#===========================================================================
+def compute_pred_stats(semantic_logits, label_ce):
+    """
+    semantic_logits: (B,C,H,W) logits (已套 bias 後、可 argmax)
+    label_ce: (B,H,W) long
+    """
+    pred = semantic_logits.argmax(1)
+    pred_fg_ratio = float((pred > 0).float().mean().item())
+    gt_fg_ratio   = float((label_ce > 0).float().mean().item())
+    pred_unique   = torch.unique(pred).detach().cpu().tolist()
+    return pred, pred_fg_ratio, gt_fg_ratio, pred_unique
+
+@torch.no_grad()
+def fg_hist_dom(pred, num_classes):
+    fg_pixels = pred[pred > 0]
+    if fg_pixels.numel() == 0:
+        return -1, 0.0
+    hist = torch.bincount(fg_pixels, minlength=num_classes).float()
+    fg_hist = hist[1:]
+    fg_ratio = fg_hist / fg_hist.sum().clamp_min(1.0)
+    dom_ratio = float(fg_ratio.max().item())
+    dom_cls   = int(fg_ratio.argmax().item() + 1)
+    return dom_cls, dom_ratio
+
+def dice_softmax_loss(dice_loss_fn, semantic_logits, label_ce):
+    # 你的 DiceLoss 可能吃 prob；這裡統一先 softmax
+    prob = torch.softmax(semantic_logits, dim=1)
+    return dice_loss_fn(prob, label_ce, softmax=False)
+
+@torch.no_grad()
+def log_margin_quantiles(semantic_logits):
+    bg = semantic_logits[:, 0]
+    fg = semantic_logits[:, 1:].amax(dim=1)
+    d = (fg - bg).flatten()
+    q01 = float(torch.quantile(d, 0.01).item())
+    q05 = float(torch.quantile(d, 0.05).item())
+    q10 = float(torch.quantile(d, 0.10).item())
+    q50 = float(torch.quantile(d, 0.50).item())
+    mean = float(d.mean().item())
+    return q01, q05, q10, q50, mean
+
+# -------------------------
+# Phase schedule
+# -------------------------
+class PhaseScheduler:
+    """
+    Phase 1: 只求不塌陷（只留 fg_bg + fg_cls(+小dice)，所有正則=0）
+    Phase 2: 加少量幾何正則（area/overlap 小權重）
+    Phase 3: 再加 anti-collapse（cls_div / pix_div / q_div / pseudo）
+    """
+    def __init__(self, p1_epochs=2, p2_epochs=10, p3_epochs=15):
+        self.p1_epochs = p1_epochs
+        self.p2_epochs = p2_epochs
+        self.p3_epochs = p3_epochs
+
+    def phase(self, epoch_num):
+        
+        if epoch_num < self.p1_epochs:
+            return 1
+        elif epoch_num < self.p2_epochs:
+            return 2
+        elif epoch_num < self.p3_epochs:
+            return 3
+        else:
+            return 4
+        
+        
+    def weights(self, epoch_num):
+        ph = self.phase(epoch_num)
+
+        # ---- Base (always on) ----
+        w = {
+            "fb": 1.0,          # Stage1 fg/bg
+            "cls": 1.0,         # Stage2 fg class CE
+            "dice": 0.15,       # 小（避免主導）
+            "cov": 0.0,         # 可選：先關，因為容易推 den 行為
+            "area": 0.0,
+            "ovlp": 0.0,
+            "cls_div": 0.0,
+            "pix_div": 0.0,
+            "q_div": 0.0,
+            "pseudo": 0.0,
+        }
+
+        if ph == 1:
+            # 輕微正則：只求先學會不塌
+            w["dice"] = 0.10
+            w["cls_div"] = 2e-3   # 原本 phase3=1e-2，這裡先 1/5
+            w["pix_div"] = 6e-3   # 原本 phase3=2e-2，這裡先 1/4
+            
+        elif ph == 2:
+            # 輕量幾何（先寬鬆、權重小）
+            w["cls"] = 0.7
+            w["dice"] = 0.15
+            w["area"] = 2e-3
+            w["ovlp"] = 5e-3
+            w["cls_div"] = 2e-3
+            w["pix_div"] = 2e-2
+        elif ph == 3:
+            # 最後才加分散/去塌陷
+            w["dice"]    = 0.20
+            w["area"]    = 2e-3
+            w["ovlp"]    = 1e-2
+            w["cls_div"] = 1e-2
+            w["pix_div"] = 2e-2
+            w["q_div"]   = 5e-4
+            
+        else:
+            # 最後才加pseudo
+            w["dice"]    = 0.20
+            w["area"]    = 2e-3
+            w["ovlp"]    = 1e-2
+            w["cls_div"] = 1e-2
+            w["pix_div"] = 2e-2
+            w["q_div"]   = 5e-4
+            w["pseudo"]  = 5e-2
+
+        return ph, w
+
+# -------------------------
+# Controller (cooldown + extreme-only)
+# -------------------------
+class BgBiasController:
+    """
+    只在「極端全前景 / 極端全背景」才介入，並加 cooldown。
+    用途：止血，不是主訓練方向盤。
+    """
+    def __init__(self,
+                 init_bias=0.0,
+                 max_bias=20.0,
+                 q10_target=-0.2,
+                 gain=0.25,
+                 step_clip=0.30,
+                 ema_w=1.0):
+        self.bias = None
+        self.init_bias = init_bias
+        self.max_bias = max_bias
+        self.q10_target = q10_target
+        self.gain = gain
+        self.step_clip = step_clip
+        self.ema_w = ema_w
+        self.q10_ema = None
+
+    def _ensure(self, device):
+        if self.bias is None:
+            self.bias = torch.tensor(self.init_bias, device=device)
+
+    def apply(self, semantic_logits_raw):
+        self._ensure(semantic_logits_raw.device)
+        bg0 = semantic_logits_raw[:, 0:1] + self.bias
+        return torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
+
+    @torch.no_grad()
+    def step_from_logits(self, semantic_logits_biased, pred_fg_ratio=None):
+        # margin = fg_max - bg
+        bg = semantic_logits_biased[:, 0]
+        fg = semantic_logits_biased[:, 1:].amax(dim=1)
+        d = (fg - bg).flatten()
+
+        q10 = torch.quantile(d, 0.10)
+        q10_now = torch.quantile(d, 0.10)
+        self.q10_ema = q10 if self.q10_ema is None else (0.95 * self.q10_ema + 0.05 * q10)
+
+        # ---- (A) 全背景保護：如果已經幾乎全背景，就快速釋放 bias ----
+        if pred_fg_ratio is not None and pred_fg_ratio < 0.02:
+            self.bias = (self.bias - 0.20).clamp(0.0, self.max_bias)   # release fast
+            return -0.20, float(self.q10_ema.item()), float(q10_now.item())
+
+        # ---- (B) deadband：在目標附近不動，降低震盪 ----
+        deadband = 0.03
+        err = float(self.q10_ema.item() - self.q10_target)
+        if abs(err) < deadband:
+            self.bias = (self.bias * 0.999).clamp(0.0, self.max_bias)  # tiny decay
+            return 0.0, float(self.q10_ema.item()), float(q10_now.item())
+
+        # ---- (C) 非對稱步幅：釋放要比增加快（避免鎖死）----
+        step = err * self.gain
+        step = float(np.clip(step, -self.step_clip * 2.0, +self.step_clip))  # release 2x faster
+        self.bias = (self.bias + step).clamp(0.0, self.max_bias)
+        return step, float(self.q10_ema.item()), float(q10_now.item())
+
+# -------------------------
+# Core: build semantic logits from (class_logits, mask_probs)
+# -------------------------
+def build_semantic_logits(class_logits, mask_probs, den_clamp=0.2, T_cls=4.0, epoch_num=None):
+    """
+    class_logits: (B,Q,C) raw logits
+    mask_probs  : (B,Q,H,W) sigmoid(mask)
+    Return semantic_logits_raw: (B,C,H,W) (logits space)
+    """
+    B, Q, H, W = mask_probs.shape
+    # safe den
+    den_raw = mask_probs.sum(dim=1)              # (B,H,W)
+    den = den_raw.clamp_min(den_clamp)           # (B,H,W)
+
+    # log-sum-exp trick (stable mixture of query logits weighted by mask probs)
+    log_mask = torch.log(mask_probs.clamp_min(1e-6))              # (B,Q,H,W)
+    log_den  = torch.log(den.clamp_min(1e-6)).unsqueeze(1)        # (B,1,H,W)
+
+    # temperature for class logits to prevent huge dominance early
+    T_cls = 8.0 if epoch_num < 1 else 4.0
+    cls = (class_logits / T_cls).clamp(-5.0, +5.0)                                   # (B,Q,C)
+    semantic_logits_raw = torch.logsumexp(
+        cls.unsqueeze(-1).unsqueeze(-1) + log_mask.unsqueeze(2),  # (B,Q,C,H,W)
+        dim=1
+    ) - log_den                                                  # (B,C,H,W)
+
+    return semantic_logits_raw, den_raw
+
+# -------------------------
+# Stage1 fg/bg loss (keep as you already do)
+# -------------------------
+def stage1_fg_bg_loss(semantic_logits2, label_ce,
+                      target_ratio_mult=1.5,
+                      tau_ema_state=None,
+                      tau_mom=0.98,
+                      posw_cap=80.0):
+    """
+    用 semantic logits 的 fg-vs-bg margin 做二元判斷（不改你架構）
+    回傳：loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema_state
+    """
+    bg_logit = semantic_logits2[:, 0:1]             # (B,1,H,W)
+    fg_logit = semantic_logits2[:, 1:].amax(1, True)  # (B,1,H,W)
+    diff = fg_logit - bg_logit                      # (B,1,H,W)
+
+    with torch.no_grad():
+        gt_is_fg = (label_ce > 0).float().unsqueeze(1)
+        gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)
+        target_ratio = (gt_fg_ratio * target_ratio_mult).clamp(0.005, 0.20)
+
+        flat = diff.detach().flatten()
+        N = flat.numel()
+        k = int((1.0 - float(target_ratio.item())) * N)
+        k = max(0, min(N - 1, k))
+        tau_batch = flat.kthvalue(k + 1).values
+
+        if tau_ema_state is None:
+            tau_ema = tau_batch
+        else:
+            tau_ema = tau_mom * tau_ema_state + (1 - tau_mom) * tau_batch
+
+        fg_frac = gt_is_fg.mean().clamp_min(1e-4)
+        pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=posw_cap)
+
+    fb_logit = (diff - tau_ema).clamp(-12, 12)  # (B,1,H,W)
+    loss_fg_bg = F.binary_cross_entropy_with_logits(
+        fb_logit, gt_is_fg, pos_weight=pos_weight
+    )
+
+    with torch.no_grad():
+        stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
+    if stage1_fg_ratio < 0.01:
+        tau_ema = tau_ema - 0.5
+        fb_logit = (diff - tau_ema).clamp(-12, 12)
+        loss_fg_bg = F.binary_cross_entropy_with_logits(
+            fb_logit, gt_is_fg, pos_weight=pos_weight
+        )
+        stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
+    return loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema
+
+# -------------------------
+# Stage2 fg class CE on GT fg (recommended early)
+# -------------------------
+def stage2_fg_cls_loss(semantic_logits2, label_ce, cls_count_ema=None, cls_mom=0.99, iter_num=None):
+    """
+    只在 GT fg pixels 做 8-class CE (label-1) + EMA inverse-freq reweight
+    semantic_logits2: (B,9,H,W)
+    label_ce: (B,H,W) in 0..8
+    """
+    device = semantic_logits2.device
+    gt_fg = (label_ce > 0)
+    if not gt_fg.any():
+        return torch.tensor(0.0, device=device), cls_count_ema
+
+    y = (label_ce[gt_fg] - 1).long()  # 0..7
+    logits_fg = semantic_logits2[:, 1:].permute(0, 2, 3, 1)[gt_fg]  # (N,8)
+
+    counts = torch.bincount(y, minlength=8).float().to(device)
+
+    if cls_count_ema is None:
+        cls_count_ema = torch.ones(8, device=device)
+
+    with torch.no_grad():
+        cls_m = 0.95 if iter_num < 2000 else 0.99
+        cls_mom = cls_m
+        cls_count_ema = cls_count_ema * cls_mom + counts * (1 - cls_mom)
+        w = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(1.0, 10.0)
+        w = w / w.mean().clamp_min(1e-6)
+
+    loss = F.cross_entropy(logits_fg, y, weight=w, label_smoothing=0.05)
+    return loss, cls_count_ema
+
+# -------------------------
+# Regularizers (only enabled in later phases)
+# -------------------------
+def reg_area_pen(mask_probs):
+    """
+    area_pen = log(Q) - H(area distribution) >=0
+    """
+    Q = mask_probs.size(1)
+    area = mask_probs.mean(dim=(2, 3))  # (B,Q)
+    p = area / (area.sum(dim=1, keepdim=True) + 1e-6)
+    p = p.clamp_min(1e-6)
+    H = -(p * p.log()).sum(dim=1).mean()
+    area_pen = math.log(Q) - H
+    return area_pen
+
+def reg_overlap_pen(mask_probs, den_raw, thr=2.0):
+    # 門檻寬鬆，不要早期把 den 壓死
+    return F.relu(den_raw - thr).pow(2).mean()
+
+def reg_cls_div(class_logits):
+    """
+    batch-level KL(p||U) on FG classes (queries averaged)
+    """
+    q = torch.softmax(class_logits, dim=-1)  # (B,Q,C)
+    p = q[..., 1:].mean(dim=(0, 1))          # (C-1,)
+    p = p / p.sum().clamp_min(1e-6)
+    u = torch.full_like(p, 1.0 / p.numel())
+    return torch.sum(p * (p.clamp_min(1e-6).log() - u.log()))
+
+def reg_pix_div(semantic_logits2, label_ce, fb_logit):
+    """
+    pixel-level KL(p || U) over predicted FG class distribution
+    Priority:
+      1) Stage1 predicted FG pixels (fb_logit > 0)
+      2) GT FG pixels (fallback)
+    """
+    device = semantic_logits2.device
+
+    # FG class probabilities (exclude background)
+    prob = torch.softmax(semantic_logits2, dim=1)[:, 1:]  # (B,8,H,W)
+
+    # 1) Stage1 predicted FG
+    stage1_fg = (fb_logit.squeeze(1) > 0)   # (B,H,W)
+    if stage1_fg.any():
+        p_fg = prob.permute(0, 2, 3, 1)[stage1_fg].mean(dim=0)
+
+    else:
+        # 2) Fallback to GT FG
+        gt_fg = (label_ce > 0)
+        if not gt_fg.any():
+            return torch.tensor(0.0, device=device)
+
+        p_fg = prob.permute(0, 2, 3, 1)[gt_fg].mean(dim=0)
+
+    # Normalize & KL to uniform
+    p_fg = p_fg / p_fg.sum().clamp_min(1e-6)
+    u = torch.full_like(p_fg, 1.0 / p_fg.numel())
+
+    return torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))
+
+def reg_q_div(class_logits, margin=0.9):
+    """
+    讓 queries 的 FG class distribution 不要彼此太像（cosine sim）
+    """
+    probs = torch.softmax(class_logits, dim=-1)[..., 1:]  # (B,Q,8)
+    q = probs.mean(dim=0)                                 # (Q,8)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    sim = torch.matmul(qn, qn.t())                        # (Q,Q)
+    eye = torch.eye(sim.size(0), device=sim.device)
+    sim_off = sim * (1.0 - eye)
+    return torch.relu(sim_off - margin).pow(2).mean()
+
+# -------------------------
+# Wandb image logger (every N iters)
+# -------------------------
+@torch.no_grad()
+def wandb_log_image(wandb, image_batch, pred_mask, gt_mask, class_labels, caption):
+    """
+    image_batch: (B,1/3,H,W) tensor
+    pred_mask/gt_mask: (H,W) numpy or tensor
+    """
+    img = image_batch[0, 0].detach().cpu().float().numpy()
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    pm = pred_mask.detach().cpu().numpy() if torch.is_tensor(pred_mask) else pred_mask
+    gm = gt_mask.detach().cpu().numpy() if torch.is_tensor(gt_mask) else gt_mask
+    wandb.log({
+        "train/pred_vs_gt": wandb.Image(
+            img,
+            masks={
+                "predictions": {"mask_data": pm, "class_labels": class_labels},
+                "ground_truth": {"mask_data": gm, "class_labels": class_labels},
+            },
+            caption=caption
+        )
+    })
+
+# =========================================================
+# ✅ Drop-in skeleton for your trainer loop core
+# =========================================================
+def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
+                       class_labels,
+                       iter_num,
+                       phase_sched,
+                       controller,
+                       tau_ema_state,
+                       cls_count_ema,
+                       trainable_params,
+                       epoch_num,
+                       image_batch,
+                       label_batch):
+    """
+    你在 trainer_synapse 裡每個 batch 呼叫一次即可。
+    回傳更新後狀態：iter_num, tau_ema_state, cls_count_ema
+    """
+    model.train()
+    image_batch = image_batch.cuda()
+    label_batch = label_batch.cuda()
+
+    # label -> (B,H,W)
+    if label_batch.dim() == 4 and label_batch.size(1) == 1:
+        label_ce = label_batch.squeeze(1).long()
+    else:
+        label_ce = label_batch.long()
+
+    # -------------------------
+    # forward (你的 model 回傳 class_logits, masks(list))
+    # -------------------------
+    class_logits, masks = model(image_batch)
+    mask_logits = masks[-1]
+    mask_logits = F.interpolate(mask_logits, size=(args.img_size, args.img_size),
+                                mode="bilinear", align_corners=False)
+    mask_probs = torch.sigmoid(mask_logits)  # (B,Q,H,W)
+    
+    semantic_logits_raw, den_raw = build_semantic_logits(
+        class_logits, mask_probs, den_clamp=0.2, T_cls=4.0, epoch_num=epoch_num
+    )
+
+    # -------------------------
+    # controller apply (safe)
+    # -------------------------
+    semantic_logits2 = controller.apply(semantic_logits_raw)
+
+    # compute pred stats (after bias)
+    pred, pred_fg_ratio, gt_fg_ratio, pred_unique = compute_pred_stats(semantic_logits2, label_ce)
+    dom_cls, dom_ratio = fg_hist_dom(pred, args.num_classes)
+
+    # controller step (extreme-only + cooldown)
+    delta, q10_ema, q10_now = controller.step_from_logits(semantic_logits2, pred_fg_ratio=pred_fg_ratio)
+
+    # NOTE: 你要讓「當次 loss」用更新後 bias 嗎？
+    # 這裡採「下一 iter 生效」更穩（避免同 iter 震盪）
+    # 如果你想當次生效，把上面 apply/compute 移到 step 後再 apply 一次。
+
+    # -------------------------
+    # Phase weights
+    # -------------------------
+    ph, w = phase_sched.weights(epoch_num)
+
+    # -------------------------
+    # Stage1 loss (fg/bg)
+    # -------------------------
+    loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema_state = stage1_fg_bg_loss(
+        semantic_logits2, label_ce,
+        target_ratio_mult=1.5,
+        tau_ema_state=tau_ema_state,
+        tau_mom=0.98,
+        posw_cap=80.0
+    )
+
+    # -------------------------
+    # Stage2 loss (fg class on GT fg)
+    # -------------------------
+    loss_fg_cls, cls_count_ema = stage2_fg_cls_loss(
+        semantic_logits2, label_ce,
+        cls_count_ema=cls_count_ema, 
+        cls_mom=0.99, 
+        iter_num=iter_num
+    )
+
+    # -------------------------
+    # Dice (small)
+    # -------------------------
+    loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
+
+    # -------------------------
+    # Regularizers (phase-gated)
+    # -------------------------
+    loss_area = reg_area_pen(mask_probs) if w["area"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_ovlp = reg_overlap_pen(mask_probs, den_raw, thr=2.0) if w["ovlp"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_cls_div = reg_cls_div(class_logits) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_pix_div = reg_pix_div(semantic_logits2, label_ce, fb_logit) if w["pix_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_q_div = reg_q_div(class_logits, margin=0.9) if w["q_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+
+    # pseudo（Phase3 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
+    loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
+
+    # -------------------------
+    # total loss
+    # -------------------------
+    loss = (
+        w["fb"]   * loss_fg_bg +
+        w["cls"]  * loss_fg_cls +
+        w["dice"] * loss_dice +
+        w["area"] * loss_area +
+        w["ovlp"] * loss_ovlp +
+        w["cls_div"] * loss_cls_div +
+        w["pix_div"] * loss_pix_div +
+        w["q_div"] * loss_q_div +
+        w["pseudo"] * loss_pseudo
+    )
+
+    # -------------------------
+    # backward / step
+    # -------------------------
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+
+    # grad norm debug
+    if iter_num % 100 == 0:
+        with torch.no_grad():
+            norms = [p.grad.detach().norm(2) for p in trainable_params if p.grad is not None]
+            total_norm = torch.norm(torch.stack(norms), 2).item() if norms else 0.0
+        print("DEBUG grad_norm (before clip):", total_norm)
+
+    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+    optimizer.step()
+
+    # -------------------------
+    # logs
+    # -------------------------
+    if iter_num % 100 == 0:
+        q01, q05, q10, q50, m = log_margin_quantiles(semantic_logits2)
+        print("===== DEBUG (Phase Scheduler + Safe Controller) =====")
+        print(f"[iter] {iter_num}, [epoch] {epoch_num}")
+        print(f"[phase] {ph} | controller_delta={delta:+.3f} | bias={float(controller.bias.item()):.3f} | q10_now={q10_now:+.3f} | q10_ema={q10_ema:+.3f}")
+        print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio(argmax): {pred_fg_ratio:.4f} | Stage1_fg_ratio: {stage1_fg_ratio:.4f}")
+        print(f"pred_unique: {pred_unique[:20]}")
+        print(f"[FG hist] dom_cls={dom_cls}, dom_ratio={dom_ratio:.3f}")
+        print(f"[margin] q01={q01:+.3f} q05={q05:+.3f} q10={q10:+.3f} q50={q50:+.3f} mean={m:+.3f}")
+        print(f"[loss] total={loss.item():.4f} | fg_bg={loss_fg_bg.item():.4f} | fg_cls={loss_fg_cls.item():.4f} | dice={loss_dice.item():.4f}")
+        if ph >= 2:
+            print(f"[reg] area={float(loss_area.item() if torch.is_tensor(loss_area) else loss_area):.6f} | ovlp={loss_ovlp.item():.6f}")
+        if ph >= 3:
+            print(f"[div] cls_div={loss_cls_div.item():.6f} | pix_div={loss_pix_div.item():.6f} | q_div={loss_q_div.item():.6f}")
+
+    # tensorboard
+    writer.add_scalar("train/phase", ph, iter_num)
+    writer.add_scalar("train/loss_total", loss.item(), iter_num)
+    writer.add_scalar("train/loss_fg_bg", loss_fg_bg.item(), iter_num)
+    writer.add_scalar("train/loss_fg_cls", loss_fg_cls.item(), iter_num)
+    writer.add_scalar("train/loss_dice", loss_dice.item(), iter_num)
+    writer.add_scalar("train/pred_fg_ratio", pred_fg_ratio, iter_num)
+    writer.add_scalar("train/stage1_fg_ratio", stage1_fg_ratio, iter_num)
+    writer.add_scalar("train/bg_bias", float(controller.bias.item()), iter_num)
+
+    # wandb scalar
+    wandb.log({
+        "train/phase": ph,
+        "train/loss_total": loss.item(),
+        "train/loss_fg_bg": loss_fg_bg.item(),
+        "train/loss_fg_cls": loss_fg_cls.item(),
+        "train/loss_dice": loss_dice.item(),
+        "train/pred_fg_ratio": pred_fg_ratio,
+        "train/stage1_fg_ratio": stage1_fg_ratio,
+        "train/bg_bias": float(controller.bias.item()),
+        "train/controller_delta": delta,
+    })
+
+    # ✅ wandb image every 100 iters
+    if iter_num % 100 == 0:
+        wandb_log_image(
+            wandb,
+            image_batch,
+            pred_mask=pred[0],
+            gt_mask=label_ce[0],
+            class_labels=class_labels,
+            caption=f"Epoch {epoch_num} Iter {iter_num} | phase={ph} | pred_fg={pred_fg_ratio:.3f}"
+        )
+
+    iter_num += 1
+    return iter_num, tau_ema_state, cls_count_ema
+
+    #=======================================================================================
+
+def worker_init_fn(worker_id: int):
     random.seed(GLOBAL_WORKER_SEED + worker_id)
 
-def focal_bce_with_logits(logits, targets, alpha=0.80, gamma=2.0, pos_weight=None):
-    # logits/targets: (B,1,H,W)
-    # 先用帶 pos_weight 的 BCE，再套 focal
-    bce = F.binary_cross_entropy_with_logits(
-        logits, targets, reduction='none', pos_weight=pos_weight
-    )
-    p = torch.sigmoid(logits)
-    pt = p * targets + (1 - p) * (1 - targets)
-    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-    loss = alpha_t * (1 - pt).pow(gamma) * bce
-    return loss.mean()
+def _to_label_ce(label_batch: torch.Tensor) -> torch.Tensor:
+    # label_batch: (B,1,H,W) or (B,H,W)
+    if label_batch.dim() == 4 and label_batch.size(1) == 1:
+        label_ce = label_batch.squeeze(1)
+    else:
+        label_ce = label_batch
+    return label_ce.long()
 
-# ---- helper: q80 function ----
-def q80(x_flat: torch.Tensor) -> torch.Tensor:
-    n = x_flat.numel()
-    k = int(0.80 * n)
-    k = max(0, min(n - 1, k))
-    return x_flat.kthvalue(k + 1).values  # 1-based
+def _maybe_skip_slice(label_ce: torch.Tensor, bg_keep_prob: float, min_fg_ratio: float) -> bool:
+    # return True => skip
+    fg_cnt = (label_ce > 0).sum().item()
+    if fg_cnt == 0:
+        return (torch.rand(1, device=label_ce.device).item() > bg_keep_prob)
 
+    fg_ratio = (label_ce > 0).float().mean().item()
+    if fg_ratio < min_fg_ratio:
+        return (torch.rand(1, device=label_ce.device).item() > 0.2)
+
+    return False
+
+
+
+'''
+
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+
+
+
+def _poly_lr(base_lr: float, iter_num: int, max_iterations: int, min_lr_ratio: float = 0.05, power: float = 0.9) -> float:
+    min_lr = base_lr * min_lr_ratio
+    t = min(1.0, max(0.0, iter_num / max_iterations))
+    return min_lr + (base_lr - min_lr) * (1.0 - t) ** power
+
+@torch.no_grad()
+def _update_ema_scalar(old: Optional[torch.Tensor], new: torch.Tensor, mom: float) -> torch.Tensor:
+    return new if old is None else (mom * old + (1.0 - mom) * new)
+
+def _logsumexp_semantic_logits(
+    class_logits: torch.Tensor,     # (B,Q,C)
+    mask_probs: torch.Tensor,       # (B,Q,H,W)
+    den_raw: torch.Tensor,          # (B,H,W) = sum_q mask_probs
+    T_cls: float = 4.0,
+) -> torch.Tensor:
+    """
+    semantic_logits_raw[c,h,w] = log( sum_q exp(class_logit[q,c]) * mask_prob[q,h,w] ) - log( sum_q mask_prob[q,h,w] )
+    以 logsumexp 方式做，數值更穩。
+    """
+    # temperature on class logits to reduce extreme domination
+    cls = class_logits / T_cls                                # (B,Q,C)
+    log_mask = torch.log(mask_probs.clamp_min(1e-6))          # (B,Q,H,W)
+    log_den  = torch.log(den_raw.clamp_min(1e-6)).unsqueeze(1)  # (B,1,H,W)
+
+    # (B,Q,C,1,1) + (B,Q,1,H,W) -> (B,Q,C,H,W) log terms
+    logits = torch.logsumexp(
+        cls.unsqueeze(-1).unsqueeze(-1) + log_mask.unsqueeze(2),
+        dim=1
+    ) - log_den                                               # (B,C,H,W)
+    return logits
+
+@torch.no_grad()
+def _bg_bias_controller(
+    semantic_logits_raw: torch.Tensor,     # (B,C,H,W)
+    bg_bias_ema: torch.Tensor,             # scalar tensor
+    q10_ema: Optional[torch.Tensor],
+    iter_num: int,
+    q10_target: float = -0.2,              # want q10(fg-bg) <= -0.2
+    q10_mom: float = 0.95,
+    gain: float = 0.20,
+    step_clip: float = 0.12,
+    ema_w: float = 0.08,
+    bias_min: float = 0.0,
+    bias_max: float = 20.0,
+    debug: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
+    """
+    用 (fg_max - bg) 的分位數 q10 做回授控制，調整 bg bias，抑制全前景崩潰。
+    回傳：semantic_logits_biased, new_bg_bias_ema, new_q10_ema, log_dict
+    """
+    # apply current bias
+    bg0 = semantic_logits_raw[:, 0:1] + bg_bias_ema
+    semantic_logits_biased = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
+
+    # margins
+    bg = semantic_logits_biased[:, 0]               # (B,H,W)
+    fg = semantic_logits_biased[:, 1:].amax(dim=1)  # (B,H,W)
+    d  = (fg - bg).flatten()                        # (B*H*W,)
+
+    m_q10 = torch.quantile(d, 0.10)
+    q10_ema = m_q10 if q10_ema is None else (q10_mom * q10_ema + (1.0 - q10_mom) * m_q10)
+
+    # want q10 <= target => err = q10 - target
+    err = float(q10_ema.item() - q10_target)
+    step_val = float(np.clip(err * gain, -step_clip, +step_clip))
+    step = torch.tensor(step_val, device=semantic_logits_raw.device)
+
+    new_bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(bias_min, bias_max)
+
+    # re-apply updated bias for downstream use
+    bg0 = semantic_logits_raw[:, 0:1] + new_bg_bias_ema
+    semantic_logits_biased = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
+
+    # fg ratio before/after (for logs)
+    pre_fg  = float((semantic_logits_raw.argmax(1) > 0).float().mean().item())
+    post_fg = float((semantic_logits_biased.argmax(1) > 0).float().mean().item())
+
+    log_dict = {
+        "bias/bg_bias_ema": float(new_bg_bias_ema.item()),
+        "bias/q10_ema": float(q10_ema.item()),
+        "bias/step": float(step.item()),
+        "bias/fg_pre": pre_fg,
+        "bias/fg_post": post_fg,
+    }
+
+    if debug:
+        q01 = float(torch.quantile(d, 0.01).item())
+        q05 = float(torch.quantile(d, 0.05).item())
+        q50 = float(torch.quantile(d, 0.50).item())
+        log_dict.update({"bias/q01": q01, "bias/q05": q05, "bias/q50": q50, "bias/d_mean": float(d.mean().item())})
+
+    return semantic_logits_biased, new_bg_bias_ema, q10_ema, log_dict
+
+@torch.no_grad()
+def _calibrate_tau_from_target_ratio(
+    diff: torch.Tensor,             # (B,1,H,W) fg_logit - bg_logit
+    label_ce: torch.Tensor,         # (B,H,W)
+    tau_ema: Optional[torch.Tensor],
+    iter_num: int,
+    target_mult: float = 1.5,
+    target_min: float = 0.01,
+    target_max: float = 0.12,
+    tau_mom_base: float = 0.98,
+    tau_mom_fast: float = 0.95,
+    stage1_fg_ratio_ema: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """
+    依 GT 前景比例決定 target_ratio，再用 diff 的 kthvalue 取 tau，
+    使得 (diff > tau) 的比例大約落在 target_ratio。
+    """
+    gt_is_fg = (label_ce > 0).float().unsqueeze(1)
+    gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)
+    target_ratio = (gt_fg_ratio * target_mult).clamp(target_min, target_max)
+
+    flat = diff.flatten()
+    N = flat.numel()
+    k = int((1.0 - float(target_ratio.item())) * N)
+    k = max(0, min(N - 1, k))
+    tau_batch = flat.kthvalue(k + 1).values
+
+    if tau_ema is None:
+        tau_ema = tau_batch
+    else:
+        # 如果 stage1 太寬鬆（>0.25）就讓 tau 更新更快一些
+        mom = tau_mom_fast if (stage1_fg_ratio_ema is not None and stage1_fg_ratio_ema > 0.25 and iter_num % 10 == 0) else tau_mom_base
+        tau_ema = mom * tau_ema + (1.0 - mom) * tau_batch
+
+    return tau_ema, tau_batch, target_ratio, float(gt_fg_ratio.item())
+
+def _compute_stage1_loss(
+    semantic_logits: torch.Tensor,  # (B,C,H,W) (after bias)
+    label_ce: torch.Tensor,         # (B,H,W)
+    tau: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """
+    Stage1: fg vs bg
+    使用 fb_logit = (fg_max - bg) - tau
+    """
+    gt_is_fg = (label_ce > 0).float().unsqueeze(1)
+    bg_logit = semantic_logits[:, 0:1]
+    fg_logit = semantic_logits[:, 1:].amax(1, keepdim=True)
+    diff = fg_logit - bg_logit
+    fb_logit = (diff - tau).clamp(-12, 12)
+
+    with torch.no_grad():
+        fg_frac = gt_is_fg.mean().clamp_min(1e-4)
+        pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=80.0)
+
+    loss_fg_bg = F.binary_cross_entropy_with_logits(fb_logit, gt_is_fg, pos_weight=pos_weight)
+    return loss_fg_bg, fb_logit, diff, float(pos_weight.item())
+
+def _compute_stage2_fg_cls_loss(
+    semantic_logits: torch.Tensor,  # (B,C,H,W) after bias
+    label_ce: torch.Tensor,         # (B,H,W)
+    cls_count_ema: torch.Tensor,    # (8,)
+    cls_mom: float = 0.99,
+    w_clip: Tuple[float, float] = (1.0, 10.0),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Stage2: 只用 GT fg 像素做 8 類 CE（1..8）
+    並做 fg-only reweight（用 EMA 的 inverse-freq）
+    """
+    gt_fg = (label_ce > 0)
+    device = semantic_logits.device
+    loss_fg_cls = torch.tensor(0.0, device=device)
+
+    if not gt_fg.any():
+        return loss_fg_cls, cls_count_ema
+
+    fg_logits = semantic_logits[:, 1:]  # (B,8,H,W)
+    y = (label_ce[gt_fg] - 1).long()    # (N_fg,) in 0..7
+    logits_fg = fg_logits.permute(0, 2, 3, 1)[gt_fg]  # (N_fg, 8)
+
+    counts = torch.bincount(y, minlength=8).float().to(device)  # (8,)
+    with torch.no_grad():
+        cls_count_ema = cls_count_ema * cls_mom + counts * (1.0 - cls_mom)
+        w = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(w_clip[0], w_clip[1])
+        w = w / w.mean().clamp_min(1e-6)
+
+    loss_fg_cls = F.cross_entropy(logits_fg, y, weight=w)
+    return loss_fg_cls, cls_count_ema
+
+@torch.no_grad()
+def _compute_pseudo_loss(
+    semantic_logits: torch.Tensor,  # (B,C,H,W)
+    fb_logit: torch.Tensor,         # (B,1,H,W) stage1 gate
+    epoch_num: int,
+    enable_pred_fg_cap: float = 0.60,
+    conf_thr: float = 0.92,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    pseudo: 高信心 fg 像素，用 label smoothing 的 CE。
+    """
+    device = semantic_logits.device
+    prob = torch.softmax(semantic_logits, dim=1)
+    pred = prob.argmax(dim=1)
+    pred_fg_ratio = float((pred > 0).float().mean().item())
+
+    enable = (pred_fg_ratio < enable_pred_fg_cap and epoch_num > 1)
+    loss_pseudo = torch.tensor(0.0, device=device)
+
+    if not enable:
+        return loss_pseudo, {"pseudo/enabled": 0.0, "pseudo/pred_fg_ratio": pred_fg_ratio, "pseudo/n": 0.0}
+
+    p_fg = 1.0 - prob[:, 0]  # (B,H,W)
+    pred_is_fg = (fb_logit.squeeze(1) > 0)
+    pseudo_mask = (pred > 0) & pred_is_fg & (p_fg > conf_thr)
+    if not pseudo_mask.any():
+        return loss_pseudo, {"pseudo/enabled": 1.0, "pseudo/pred_fg_ratio": pred_fg_ratio, "pseudo/n": 0.0}
+
+    pseudo_y = (pred[pseudo_mask] - 1).long()  # 0..7
+    logits_sel = semantic_logits[:, 1:].permute(0, 2, 3, 1)[pseudo_mask]  # (N,8)
+    loss_pseudo = F.cross_entropy(logits_sel, pseudo_y, label_smoothing=0.10)
+
+    return loss_pseudo, {"pseudo/enabled": 1.0, "pseudo/pred_fg_ratio": pred_fg_ratio, "pseudo/n": float(pseudo_mask.sum().item())}
+
+def _compute_regularizers(
+    mask_probs: torch.Tensor,      # (B,Q,H,W)
+    den_raw: torch.Tensor,         # (B,H,W)
+    label_ce: torch.Tensor,        # (B,H,W)
+    explore_mode: bool,
+    overlap_thr: float = 2.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """
+    coverage: 只在 GT fg 上拉 den，避免全圖變 fg
+    area_pen: log(Q) - entropy(area dist)
+    overlap_pen: relu(den_raw - thr)^2
+    """
+    device = mask_probs.device
+    gt_fg = (label_ce > 0)
+    if gt_fg.any():
+        den_fg = den_raw[gt_fg].mean()
+    else:
+        den_fg = den_raw.mean()
+
+    t_cov = 1.0 if explore_mode else 0.8
+    loss_cov = F.relu(t_cov - den_fg).pow(2)
+
+    Q = mask_probs.size(1)
+    area = mask_probs.mean(dim=(2, 3))                    # (B,Q)
+    p = area / (area.sum(dim=1, keepdim=True) + 1e-6)
+    p = p.clamp_min(1e-6)
+    H = -(p * p.log()).sum(dim=1).mean()                  # entropy
+    area_pen = torch.tensor(float(np.log(Q)), device=device) - H  # >=0
+
+    overlap_pen = F.relu(den_raw - overlap_thr).pow(2).mean()
+
+    logs = {
+        "reg/den_fg": float(den_fg.item()),
+        "reg/area_H": float(H.item()),
+        "reg/N_eff": float(torch.exp(H).item()),
+    }
+    return loss_cov, area_pen, overlap_pen, logs
+
+def _compute_diversity_losses(
+    class_logits: torch.Tensor,    # (B,Q,C)
+    semantic_prob: torch.Tensor,   # (B,C,H,W)
+    label_ce: torch.Tensor,        # (B,H,W)
+    q_sim_margin: float = 0.90,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    - loss_cls_div: batch-level class distribution vs uniform (avoid single-class collapse)
+    - loss_pix_div: GT fg pixels 的 predicted fg distribution vs uniform
+    - loss_q_div  : query-wise class distribution cosine similarity penalty
+    """
+    device = class_logits.device
+    q_cls_prob = torch.softmax(class_logits, dim=-1)      # (B,Q,C)
+
+    # cls_div: mean distribution over queries & batch, FG only
+    p_cls = q_cls_prob[..., 1:].mean(dim=(0, 1))          # (8,)
+    p_cls = p_cls / p_cls.sum().clamp_min(1e-6)
+    u = torch.full_like(p_cls, 1.0 / p_cls.numel())
+    loss_cls_div = torch.sum(p_cls * (p_cls.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
+
+    # pix_div: predicted fg distribution over GT fg pixels
+    gt_fg = (label_ce > 0)
+    loss_pix_div = torch.tensor(0.0, device=device)
+    if gt_fg.any():
+        pmap = semantic_prob[:, 1:]                                  # (B,8,H,W)
+        p_fg = pmap.permute(0, 2, 3, 1)[gt_fg].mean(dim=0)           # (8,)
+        p_fg = p_fg / p_fg.sum().clamp_min(1e-6)
+        u2 = torch.full_like(p_fg, 1.0 / p_fg.numel())
+        loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u2.log()))  # KL
+
+    # q_div: query distribution similarity
+    q = q_cls_prob[..., 1:].mean(dim=0)                              # (Q,8)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    q_norm = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    sim = torch.matmul(q_norm, q_norm.t())                           # (Q,Q)
+    eye = torch.eye(sim.size(0), device=device)
+    sim_off = sim * (1.0 - eye)
+    loss_q_div = torch.relu(sim_off - q_sim_margin).pow(2).mean()
+
+    return loss_cls_div, loss_pix_div, loss_q_div
+
+@torch.no_grad()
+def _update_explore_mode(
+    fb_logit: torch.Tensor,                 # (B,1,H,W)
+    stage1_fg_ratio_ema: Optional[float],
+    explore_mode: bool,
+    ema_alpha: float = 0.95,
+    hi_off: float = 0.20,
+    lo_on: float = 0.05,
+) -> Tuple[float, bool, float]:
+    pred_is_fg = (fb_logit > 0).float()
+    stage1_fg_ratio = float(pred_is_fg.mean().item())
+    stage1_fg_ratio_ema = stage1_fg_ratio if stage1_fg_ratio_ema is None else (ema_alpha * stage1_fg_ratio_ema + (1.0 - ema_alpha) * stage1_fg_ratio)
+
+    if explore_mode:
+        if stage1_fg_ratio_ema > hi_off:
+            explore_mode = False
+    else:
+        if stage1_fg_ratio_ema < lo_on:
+            explore_mode = True
+
+    return stage1_fg_ratio, explore_mode, stage1_fg_ratio_ema
+'''
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
 
@@ -58,7 +964,7 @@ def trainer_synapse(args, model, snapshot_path):
     GLOBAL_WORKER_SEED = args.seed
 
     logging.basicConfig(
-        filename=snapshot_path + "/log.txt",
+        filename=os.path.join(snapshot_path, "log.txt"),
         level=logging.INFO,
         format='[%(asctime)s.%(msecs)03d] %(message)s',
         datefmt='%H:%M:%S'
@@ -66,9 +972,6 @@ def trainer_synapse(args, model, snapshot_path):
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    # ----------------------------
-    # class labels for wandb vis
-    # ----------------------------
     class_labels = {
         0: "Background",
         1: "Aorta",
@@ -105,30 +1008,23 @@ def trainer_synapse(args, model, snapshot_path):
     valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=1)
 
     print("--------------------------------------------------------------")
-    print("The length of train set is: {}".format(len(db_train)))
-    print("The length of val set is: {}".format(len(db_val)))
+    print(f"The length of train set is: {len(db_train)}")
+    print(f"The length of val set is: {len(db_val)}")
     print("--------------------------------------------------------------")
-
-    best_performance = 0.0
-    iterator = tqdm(range(max_epoch), ncols=70)
 
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     model.train()
 
+    writer = SummaryWriter(os.path.join(snapshot_path, "log"))
     dice_loss = DiceLoss(num_classes)
 
     # ----------------------------
-    # optimizer only on trainable params
+    # optimizer (trainable params only) + class_head smaller lr
     # ----------------------------
-
-
     m = model.module if isinstance(model, nn.DataParallel) else model
 
-    # 取出 class_head 參數
     class_head_params = list(m.class_head.parameters())
-
-    # 其餘可訓練參數（排除 class_head）
     other_trainable_params = []
     for name, p in m.named_parameters():
         if not p.requires_grad:
@@ -142,696 +1038,103 @@ def trainer_synapse(args, model, snapshot_path):
             {"params": other_trainable_params, "lr": base_lr},
             {"params": class_head_params, "lr": base_lr * 0.1},
         ],
-        weight_decay=0.0001
+        weight_decay=1e-4
     )
     trainable_params = other_trainable_params + class_head_params
+
     print("Trainable param tensors (other):", len(other_trainable_params))
     print("Trainable param tensors (class_head):", len(class_head_params))
     print("Optimizer param groups:", len(optimizer.param_groups))
-    print("Params in group0(other):", len(optimizer.param_groups[0]["params"]))
-    print("Params in group1(class_head):", len(optimizer.param_groups[1]["params"]))
-
-
-
-    print("Trainable param tensors:", len(trainable_params))
-    print("Trainable param elements:", sum(p.numel() for p in trainable_params))
-    print("Optimizer param groups:", len(optimizer.param_groups))
-    print("Params in group0:", len(optimizer.param_groups[0]["params"]))
-
-    writer = SummaryWriter(snapshot_path + '/log')
-    iter_num = 0
-    max_iterations = args.max_epochs * len(trainloader)
-    logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
 
     # ----------------------------
-    # explore_mode (只影響 lambda_cls；不再切換 Stage1 loss 規則)
-    # ----------------------------
-    explore_mode = True
-    stage1_fg_ratio_ema = None
-    bg_bias_ema = None
-    ema_alpha = 0.95
-
-    # ----------------------------
-    # sampling knobs (保留你原本的 bg slice keep)
+    # knobs (keep your original behavior)
     # ----------------------------
     bg_keep_prob = 0.2
-    min_fg_ratio = 0.005  # 0.5%
+    min_fg_ratio = 0.005
+    ema_alpha = 0.95
 
-    
+    # stage controllers / EMAs
+    explore_mode = True
+    stage1_fg_ratio_ema: Optional[float] = None
+    bg_bias_ema: Optional[torch.Tensor] = None
+    tau_ema: Optional[torch.Tensor] = None
+    q10_ema: Optional[torch.Tensor] = None
 
-    # ----------------------------
-    # Stage1 scaling (先固定，避免你現在 /3 亂飄)
-    # ----------------------------
-    fb_div = 2.0  # 你原本 /3，先保留；若仍敏感再做 scale-EMA
-    tau_ema = None
-    cls_ema = torch.ones(8, device='cuda')  # init uniform-ish
-    cls_ema = cls_ema / cls_ema.sum()
-    num_fg_classes = 8
-    #ema_cls_count = torch.ones(num_fg_classes, device='cuda')  # avoid zero
-    #ema_m = 0.99  # 越大越穩
-    cls_count_ema = torch.ones(num_fg_classes, device='cuda')  # init >0 to avoid inf
-    cls_mom = 0.99  # 越大越穩
+    # class freq EMA (8 fg classes)
+    cls_count_ema = torch.ones(8, device="cuda")
+    cls_mom = 0.99
+
+    # temperature
+    T_cls = 4.0
+
+    # loss weights (same as your current setup)
+    lambda_fb   = 1.0
+    lambda_dice = 0.2
+    lambda_cov  = 1e-2
+    lambda_area = 2e-3
+    lambda_ovlp = 1e-2
+    lambda_cls_div = 1e-2
+    lambda_q_div = 5e-4
+    lambda_pseudo = 0.05
+    # pix_div schedule: first epoch smaller
+    # (we keep your original behavior: epoch<1 => 0.02 else 0.08)
+
+    iter_num = 0
+    best_performance = 0.0
+
+
+    phase_sched = PhaseScheduler(p1_epochs=2, p2_epochs=10, p3_epochs=15)
+    controller = BgBiasController(
+        init_bias=0.0,
+        max_bias=20.0,      # 先放大，因為你 margin 會到 +3，max_bias=2 根本不夠
+        q10_target=-0.1,    # 目標：讓 q10(fg-bg) 壓回負值
+        gain=0.12,          # 回授增益
+        step_clip=0.12,     # 單步最大調整（止血用，之後可再縮）
+        ema_w=1.0
+    )
+
+    tau_ema_state = None
+    cls_count_ema = None
+
+
+
+    max_iterations = args.max_epochs * len(trainloader)
+    logging.info(f"{len(trainloader)} iterations per epoch. {max_iterations} max iterations")
+
+    iterator = tqdm(range(max_epoch), ncols=70)
+
     for epoch_num in iterator:
         model.train()
 
         for i_batch, sampled_batch in enumerate(trainloader):
-            image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
-            image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+            image_batch, label_batch = sampled_batch["image"].cuda(), sampled_batch["label"].cuda()
+            label_ce = _to_label_ce(label_batch)
 
-            # label -> (B,H,W) long
-            if label_batch.dim() == 4 and label_batch.size(1) == 1:
-                label_ce = label_batch.squeeze(1)
-            else:
-                label_ce = label_batch
-            label_ce = label_ce.long()
+            # skip slices (same logic as before)
+            if _maybe_skip_slice(label_ce, bg_keep_prob, min_fg_ratio):
+                continue
 
             # ----------------------------
-            # skip background-only slices (保留你原策略)
+            # forward: model -> (class_logits, masks[-1]) -> mask_probs/den
             # ----------------------------
-            if (label_ce > 0).sum() == 0:
-                if torch.rand(1, device=label_ce.device).item() > bg_keep_prob:
-                    continue
-
-            if (label_ce > 0).float().mean().item() < min_fg_ratio:
-                if torch.rand(1, device=label_ce.device).item() > 0.2:
-                    continue
-
-            # ----------------------------
-            # forward
-            # ----------------------------
-            class_logits, masks = model(image_batch)  # class_logits: (B,Q,C), masks: list[(B,Q,h,w)]
-            mask_logits = masks[-1]
-            mask_logits = F.interpolate(
-                mask_logits,
-                size=(args.img_size, args.img_size),
-                mode='bilinear',
-                align_corners=False
+            iter_num, tau_ema_state, cls_count_ema = training_step_core(
+                args, model, dice_loss, optimizer, writer, wandb,
+                class_labels,
+                iter_num,
+                phase_sched,
+                controller,
+                tau_ema_state,
+                cls_count_ema,
+                trainable_params,
+                epoch_num,
+                image_batch, label_ce
             )
-            mask_probs = torch.sigmoid(mask_logits)  # (B,Q,H,W)
-            
-            # semantic logits = einsum(class_logits (logits), mask_probs)
-            #semantic_logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_probs)
-
-            #den_raw = mask_probs.sum(dim=1)                 # (B,H,W)
-            #den = den_raw.clamp_min(0.2)                    # safe for division
-            #semantic_logits = semantic_logits / den.unsqueeze(1)
-
-            log_mask = torch.log(mask_probs.clamp_min(1e-6))                 # (B,Q,H,W)
-            log_den  = torch.log(mask_probs.sum(dim=1).clamp_min(1e-6)).unsqueeze(1)  # (B,1,H,W)
-            #semantic_logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_probs) / den.unsqueeze(1)  # (B,C,H,W)
-            semantic_logits_raw = torch.logsumexp(
-                class_logits.unsqueeze(-1).unsqueeze(-1) + log_mask.unsqueeze(2),
-                dim=1
-            ) - log_den
-            '''
-            with torch.no_grad():
-                pre_fg = (semantic_logits.argmax(1) > 0).float().mean()
-            bg_mean_before = semantic_logits[:, 0].mean()
-            bg0 = semantic_logits[:, 0:1] + bg_bias_ema
-            semantic_logits = torch.cat([bg0, semantic_logits[:, 1:]], dim=1)
-            bg_mean_after = semantic_logits[:, 0].mean()
-
-            if iter_num % 100 == 0:
-                with torch.no_grad():
-                    post_fg = (semantic_logits.argmax(1) > 0).float().mean()
-                print(f"[bias_check] bg_delta={(bg_mean_after-bg_mean_before).item():+.3f} "
-                    f"bg_bias_ema={bg_bias_ema.item():.3f} fg% {pre_fg.item():.4f}->{post_fg.item():.4f}")
-            
-            
-            semantic_prob = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W) in [0,1]
-            semantic_prob = semantic_prob / den.unsqueeze(1)
-            semantic_prob = semantic_prob.clamp(1e-6, 1-1e-6)
-            semantic_logits = torch.log(semantic_prob)
-            '''    
-            # ---- multi-class extreme-value correction ----
-            # ----------------------------
-            # Stage1 logits for FG vs BG (先算出 diff，controller 也用它)
-            # ----------------------------
-            '''
-            bg_logit = semantic_logits[:, 0:1]                 # (B,1,H,W)
-            fg_logit = semantic_logits[:, 1:].logsumexp(1, True)    # (B,1,H,W)
-            diff = fg_logit - bg_logit                         # fg - bg, >0 表示 fg 贏
-            '''
-            # ----------------------------
-            # BG bias controller (用 diff 做回授，不用 argmax fg%)
-            # 目標：讓 diff 的高分位數 <= 0（代表大多數像素 BG 不輸）
-            # ----------------------------
-            
-            #semantic_logits_raw = semantic_logits
-            # init EMA
-            if bg_bias_ema is None:
-                bg_bias_ema = torch.tensor(0.0, device=semantic_logits_raw.device)
-
-            # apply current bias first (non-inplace) to measure fg%
-            bg0 = semantic_logits_raw[:, 0:1] + bg_bias_ema
-            semantic_logits2 = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)     # (B,C,H,W)
-
-            #with torch.no_grad():
-                #fg_pre = (semantic_logits_cal.argmax(1) > 0).float().mean()
-            if iter_num % 100 == 0:
-                with torch.no_grad():
-                    pre_fg  = (semantic_logits_raw.argmax(1) > 0).float().mean()
-                    post_fg = (semantic_logits2.argmax(1) > 0).float().mean()
-                    bg_delta = (semantic_logits2[:,0].mean() - semantic_logits_raw[:,0].mean()).item()
-                print(f"[bias] bg_bias_ema={bg_bias_ema.item():.3f} bg_delta={bg_delta:+.3f} fg% {pre_fg.item():.4f}->{post_fg.item():.4f}")
-            # controller target band
-            target = 0.12
-            lo, hi = 0.05, 0.25
-
-            with torch.no_grad():
-                fg_val = float(fg_pre.item())
-                if fg_val > 0.70:
-                    # very bad explosion: push BG hard, but not crazy
-                    step = torch.tensor(+0.15, device=semantic_logits_raw.device)
-                    ema_w = 0.20
-                elif fg_val > 0.40:
-                    # explosion: push BG moderately
-                    step = torch.tensor(+0.08, device=semantic_logits_raw.device)
-                    ema_w = 0.12
-                elif fg_val > hi:
-                    # above band: proportional push up (increase BG)
-                    step = torch.tensor(min(0.06, max(0.01, (fg_val - target) * 0.30)),
-                                        device=semantic_logits_raw.device)
-                    ema_w = 0.05
-                elif fg_val < lo:
-                    # below band: release BG (decrease bias)
-                    step = torch.tensor(-min(0.06, max(0.01, (target - fg_val) * 0.30)),
-                                        device=semantic_logits_raw.device)
-                    ema_w = 0.05
-                else:
-                    step = torch.tensor(0.0, device=semantic_logits_raw.device)
-                    ema_w = 0.02
-
-            # update bias (allow higher cap)
-            bg_bias_ema = (bg_bias_ema + ema_w * step).clamp(0.0, 6.0)
-
-            # re-apply updated bias for actual use downstream
-            bg_mean_before = semantic_logits_raw[:, 0].mean()
-            bg0 = semantic_logits_raw[:, 0:1] + bg_bias_ema
-            semantic_logits2 = torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
-            bg_mean_after = semantic_logits2[:, 0].mean()
-
-            with torch.no_grad():
-                fg_post = (semantic_logits2.argmax(1) > 0).float().mean()
-
-            if iter_num % 100 == 0:
-                print(f"[bias_fg] step={step.item():+.3f} bg_bias_ema={bg_bias_ema.item():.3f} "
-                    f"bg_delta={(bg_mean_after-bg_mean_before).item():+.3f} "
-                    f"fg% {fg_pre.item():.4f}->{fg_post.item():.4f}")
-            # ----------------------------
-            # Stage1: FG vs BG (加權 BCE；用 soft GT 提穩)
-            # ----------------------------
-            
-            bg_logit = semantic_logits_raw[:, 0:1]                      # (B,1,H,W)
-            fg_logit = semantic_logits_raw[:, 1:].amax(1, True)   # 取 max，和 argmax 競爭一致
-
-            diff = fg_logit - bg_logit                              # (B,1,H,W) 連續分數，不要先除
-            
-            
-            
-            with torch.no_grad():
-                gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
-                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5) 
-                target_ratio = (gt_fg_ratio * 1.5).clamp(0.003, 0.06)    
-                # 取 diff 的分位數當閾值 tau，使得 pred_fg_ratio ≈ target_ratio
-                # pred_is_fg = diff > tau
-                flat = diff.detach().flatten()
-                N = flat.numel()
-                k = int((1.0 - float(target_ratio.item())) * N)
-                k = max(0, min(N - 1, k))
-                #tau = flat.kthvalue(k + 1).values   # kthvalue 是 1-based
-                tau_batch = flat.kthvalue(k + 1).values
-            if tau_ema is None:
-                tau_ema = tau_batch
-            else:
-                if iter_num % 10 == 0:
-                    w_tau = 0.05 if stage1_fg_ratio_ema is not None and stage1_fg_ratio_ema > 0.25 else 0.02
-                    tau_ema = (1 - w_tau) * tau_ema + w_tau * tau_batch
-                #tau_ema = 0.9 * tau_ema + 0.1 * tau_batch
-
-            tau = tau_ema
-            fb_logit = (diff - tau).clamp(-12, 12)
-            # 把 tau 當成 bias：fb_logit = diff - tau
-            # 注意：tau detached，所以不會反傳梯度造成奇怪震盪
-
-            # pos_weight（你原本那套保留，但上限 80 比較合理）
-            with torch.no_grad():
-                fg_frac = gt_is_fg.mean().clamp_min(1e-4)
-                pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=80.0)
-
-            loss_fg_bg = F.binary_cross_entropy_with_logits(
-                fb_logit, gt_is_fg, pos_weight=pos_weight
-            )
-            '''
-            if iter_num % 100 == 0:
-                with torch.no_grad():
-                    bg = semantic_logits[:, 0]                 # bias 後
-                    fg = semantic_logits[:, 1:].amax(dim=1)    # bias 後
-                    x1 = fg - bg
-
-                    post_fg = (semantic_logits.argmax(1) > 0).float().mean()
-
-                    print(f"[fg%] pre={pre_fg.item():.4f} post={post_fg.item():.4f}")
-                    print(f"[bg] mean={bg.mean().item():.3f} min={bg.min().item():.3f} max={bg.max().item():.3f}")
-                    print(f"[fg(max)] mean={fg.mean().item():.3f} min={fg.min().item():.3f} max={fg.max().item():.3f}")
-                    print(f"[x1=fg-bg] mean={x1.mean().item():.3f} min={x1.min().item():.3f} max={x1.max().item():.3f}")
-                    print(f"[controller] raw_fg={raw_fg_ratio.item():.4f} step={bg_bias_step.item():+.4f} bg_bias_ema={bg_bias_ema.item():.3f}")
-            '''
-            # ----------------------------
-            # Stage2: FG class CE (保守版：只用 GT fg) + fg-only reweight
-            # ----------------------------
-            # ---- fuse Stage1 gate into semantic logits (log-prior) ----
-            #p_fg = torch.sigmoid(fb_logit)            # (B,1,H,W)
-            '''
-            prior = torch.tanh((-diff) / 2.0)                      # in [-0.5, 0.5]
-            with torch.no_grad():
-                dm = diff.mean().abs().item()
-            #beta = float(np.clip(dm, 0.5, 1.5))  # 不要乘 2，先小一點
-            beta = 1
-            fg_region = (diff > tau + 0.5).float()  # (B,1,H,W)
-            s = 0.5  # 0.3~1.0 之間都可
-            w = torch.exp(-(diff - tau ).clamp(min=0.0) / s)  # diff 越高，推力越小
-            delta = beta * prior * fg_region * w
-            delta = delta.clamp(-0.0, 0.15)
-            
-            
-
-            semantic_logits2 = semantic_logits.clone()
-            semantic_logits2[:, 0:1] = semantic_logits2[:, 0:1] + delta
-            #semantic_logits2[:, 1: ] = semantic_logits2[:, 1: ] - delta 
-            '''
-            #semantic_logits2 = semantic_logits  
-            gt_fg = (label_ce > 0)            # (B,H,W) bool
-            loss_fg_cls = torch.tensor(0.0, device=semantic_logits2.device)
-
-            if gt_fg.any():
-                fg_logits = semantic_logits2[:, 1:]                 # (B,8,H,W)
-                y = (label_ce[gt_fg] - 1).long()                    # (N_fg,) -> 0..7
-                logits_fg = fg_logits.permute(0,2,3,1)[gt_fg]
-                counts = torch.bincount(y, minlength=8).float().to(y.device)  # (8,)
-
-                with torch.no_grad():
-                    cls_count_ema.mul_(cls_mom).add_(counts, alpha=(1.0 - cls_mom))
-
-                    # inverse-freq weights
-                    w = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(1.0, 10.0)
-                    w = w / w.mean().clamp_min(1e-6)
-
-                loss_fg_cls = F.cross_entropy(
-                    logits_fg,
-                    y,
-                    weight=w
-                )
-
-            # --- Stage2 aux: high-confidence pseudo-FG (SOFT) ---
-            with torch.no_grad():
-                prob = torch.softmax(semantic_logits2, dim=1)  # (B,9,H,W)
-                p_fg = 1.0 - prob[:, 0]                        # (B,H,W)
-                pred = prob.argmax(dim=1)                      # (B,H,W)
-                pred_fg_ratio = (pred > 0).float().mean().item()
-                pred_is_fg = (fb_logit.squeeze(1) > 0)  # (B,H,W) Stage1 gate
-                pseudo_mask = (pred > 0) & pred_is_fg & (p_fg > 0.92)      # 高信心前景
-                pseudo_y = (pred[pseudo_mask] - 1).long()      # 0..7
-
-            enable_pseudo = (pred_fg_ratio < 0.60 and epoch_num > 1)
-            loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
-            if enable_pseudo and pseudo_mask.any():
-                fg_logits = semantic_logits2[:, 1:]            # (B,8,H,W)
-                logits_sel = fg_logits.permute(0,2,3,1)[pseudo_mask]  # (N,8)
-                # soft CE 用 label smoothing 避免互打
-                loss_pseudo = F.cross_entropy(logits_sel, pseudo_y, label_smoothing=0.10)
-
-            #=============loss fg-cap===================================
-            with torch.no_grad():
-                gt_is_fg = (label_ce > 0).float().unsqueeze(1)      # HARD target
-                gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)      # 避免 0/太大
-
-                # 你可以讓 stage1 稍微「偏寬鬆」一點（避免全背景）
-                # 例如 target_ratio = gt_fg_ratio * 1.5，最多不超過 0.30
-                target_ratio = (gt_fg_ratio * 2.0).clamp(0.005, 0.12)#常看到 Stage1_fg_ratio < 0.10、FN_rate > 0.8，就再提高.clamp(0.10, 0.25)
-                target_pred_fg = min(max(gt_fg_ratio * 3.0, 0.05), 0.30)   # 5%~30%
-            
-            #pred_fg_ratio_soft = (1.0 - prob[:,0]).mean()              # mean p_fg
-            #loss_fgcap = F.relu(pred_fg_ratio_soft - target_pred_fg).pow(2)
-
-            # ---- BG-only CE on GT background (small weight) ----
-            gt_bg = (label_ce == 0)                 # (B,H,W)
-            bg_l = semantic_logits2[:, 0]           # (B,H,W)
-            fg_l = semantic_logits2[:, 1:].amax(dim=1)   # (B,H,W)
-            #margin = 0.5
-            '''
-            viol = margin + fg_l - bg_l             # (B,H,W)
-
-            loss_fgcap = F.relu(viol).mean()
-            loss_bg = F.relu(viol)[gt_bg].mean() if gt_bg.any() else torch.tensor(0.0, device=label_ce.device)
-            '''
-            
-            # ----------------------------
-            # Dice (輔助，弱化)
-            # ----------------------------
-            semantic_prob = torch.softmax(semantic_logits2, dim=1)
-            loss_dice = dice_loss(semantic_prob, label_ce, softmax=False) if gt_fg.any() else \
-                torch.tensor(0.0, device=semantic_logits2.device)
-
-            # ----------------------------
-            # Regularization (止血版)
-            # 1) coverage: 只在 GT fg 上拉 den，避免全圖變前景
-            # ----------------------------
-            if gt_fg.any():
-                den_fg = den_raw[gt_fg].mean()
-            else:
-                den_fg = den_raw.mean()
-
-            t_cov = 1.0 if explore_mode else 0.8
-            loss_cov = F.relu(t_cov - den_fg).pow(2)
-
-            # ----------------------------
-            # 2) area dispersion: area_pen = log(Q) - H >= 0
-            # ----------------------------
-            Q = mask_probs.size(1)
-            area = mask_probs.mean(dim=(2, 3))  # (B,Q)
-            p = area / (area.sum(dim=1, keepdim=True) + 1e-6)
-            p = p.clamp_min(1e-6)
-            H = -(p * p.log()).sum(dim=1).mean()
-            area_pen = float(np.log(Q)) - H  # >= 0
-
-            # ----------------------------
-            # 3) overlap penalty: 門檻提高避免把 den 壓死
-            # ----------------------------
-            overlap_pen = F.relu(den_raw - 2.0).pow(2).mean()
-
-            # ----------------------------
-            # explore_mode：只影響 lambda_cls（不再切 Stage1 loss）
-            # ----------------------------
-            with torch.no_grad():
-                pred_is_fg_stage1 = (fb_logit > 0).float()
-                stage1_fg_ratio = float(pred_is_fg_stage1.mean().item())
-
-                if stage1_fg_ratio_ema is None:
-                    stage1_fg_ratio_ema = stage1_fg_ratio
-                else:
-                    stage1_fg_ratio_ema = ema_alpha * stage1_fg_ratio_ema + (1 - ema_alpha) * stage1_fg_ratio
-                
-                # ---------- Stage1 gate safety guard ----------
-                # Stage1 太寬鬆時，輕微收緊 tau（下一 iter 生效）
-                if stage1_fg_ratio_ema > 0.35:
-                    tau_ema = tau_ema + 0.10
-
-                # hysteresis
-                if explore_mode:
-                    if stage1_fg_ratio_ema > 0.20:
-                        explore_mode = False
-                else:
-                    if stage1_fg_ratio_ema < 0.05:
-                        explore_mode = True
-
-            lambda_cls = 0.2 if explore_mode else 1.0
-
-            # ===== class anti-collapse regularizer (batch-level) =====
-            # q_cls_prob: (B,Q,C)
-            q_cls_prob = torch.softmax(class_logits, dim=-1)
-
-            # 只看前景類別 1..C-1（不含 BG）
-            p_cls = q_cls_prob[..., 1:].mean(dim=(0,1))              # (C-1,)
-            p_cls = p_cls / p_cls.sum().clamp_min(1e-6)
-
-            u = torch.full_like(p_cls, 1.0 / p_cls.numel())
-            loss_cls_div = torch.sum(p_cls * (p_cls.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
-            
-            #============================================================
-            #==================================================================================================
-            class_probs = torch.softmax(class_logits, dim=-1)
-            q = class_probs[..., 1:]                    # (B,Q,8) 只看 FG 類別的機率質量
-            q = q.mean(dim=0)                                  # (Q,8) avg over batch
-            q = q / q.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-            # 讓 queries 的 class distribution 不要彼此太像：min cosine similarity
-            q_norm = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            sim = torch.matmul(q_norm, q_norm.t())             # (Q,Q)
-            margin = 0.9
-            eye = torch.eye(sim.size(0), device=sim.device)
-            sim_off = sim * (1.0 - eye)
-            loss_q_div = torch.relu(sim_off - margin).pow(2).mean()
-            #==================================================================================================
-            # ---- pixel-level anti-collapse on predicted FG distribution ----
-            gt_fg = (label_ce > 0)
-
-            
-            # 用 GT fg pixels 統計「模型預測的前景類別分布」
-            loss_pix_div = torch.tensor(0.0, device=semantic_prob.device)
-            if gt_fg.any():
-                pmap = semantic_prob[:, 1:]  # (B,8,H,W)
-                p_fg = pmap.permute(0,2,3,1)[gt_fg].mean(dim=0)  # (8,)
-                p_fg = p_fg / p_fg.sum().clamp_min(1e-6)
-                u = torch.full_like(p_fg, 1.0 / p_fg.numel())
-                loss_pix_div = torch.sum(p_fg * (p_fg.clamp_min(1e-6).log() - u.log()))  # KL(p||U)
-            
-            #============================================================
-            '''
-            with torch.no_grad():
-                if pred_fg_ratio > 0.7:
-                    with torch.no_grad():
-                        pred_raw = semantic_logits.argmax(dim=1)
-                        pred2    = semantic_logits2.argmax(dim=1)
-                        print(f"[pred_fg_ratio] raw={(pred_raw>0).float().mean().item():.4f} | gated={(pred2>0).float().mean().item():.4f}")
-            '''
-            # ----------------------------
-            # LOSS weights 
-            # ----------------------------
-            lambda_fb   = 1.0
-            lambda_dice = 0.2        # 先弱化 dice，避免和 stage loss 互打
-            lambda_cov  = 1e-2       # GT fg coverage
-            lambda_area = 2e-3       # query area dispersion
-            lambda_ovlp = 1e-2       # overlap penalty (門檻提高後再給小權重)
-            lambda_cls_div = 1e-2
-            #lambda_bg = 0.01
-            lambda_pix_div = 0.02 if epoch_num < 1 else 0.08
-            lambda_pseudo = 0.05
-            #lambda_fgcap = 0.05
-            lambda_q_div = 5e-4 
-            
-            loss = (
-                lambda_fb   * loss_fg_bg +
-                lambda_cls  * loss_fg_cls +
-                lambda_dice * loss_dice +
-                lambda_cov  * loss_cov +
-                lambda_area * area_pen +
-                lambda_ovlp * overlap_pen +
-                lambda_cls_div * loss_cls_div +
-                #lambda_bg * loss_bg +
-                lambda_pix_div * loss_pix_div +
-                lambda_pseudo * loss_pseudo +
-                #lambda_fgcap * loss_fgcap
-                lambda_q_div * loss_q_div
-            )
-
-            # ----------------------------
-            # debug print (你原本的我保留 + 補充 den_fg / N_eff)
-            # ----------------------------
-            if iter_num % 100 == 0:
-                with torch.no_grad():
-                    pred = semantic_prob.argmax(dim=1)
-                    pred_fg_ratio = float((pred > 0).float().mean().item())
-                    #gt_fg_ratio = float((label_ce > 0).float().mean().item())
-                    pred_unique = torch.unique(pred).detach().cpu().tolist()[:20]
-
-                    # FG hist / dom
-                    fg_pixels = pred[pred > 0]
-                    if fg_pixels.numel() > 0:
-                        hist = torch.bincount(fg_pixels, minlength=num_classes).float()
-                        fg_hist = hist[1:]
-                        fg_class_ratio = fg_hist / fg_hist.sum().clamp_min(1.0)
-                        fg_dom_ratio = float(fg_class_ratio.max().item())
-                        fg_dom_cls = int(fg_class_ratio.argmax().item() + 1)
-                    else:
-                        fg_dom_ratio = 0.0
-                        fg_dom_cls = -1
-
-                    # den stats
-                    den_mean = float(den_raw.mean().item())
-                    den_min = float(den_raw.min().item())
-                    den_max = float(den_raw.max().item())
-                    den_fg_dbg = float(den_fg.item()) if torch.is_tensor(den_fg) else float(den_fg)
-
-                    # N_eff
-                    Hq = -(p * p.log()).sum(dim=1).mean()
-                    N_eff = float(torch.exp(Hq).item())
-
-                    # Stage1 TP/FP/FN
-                    pred_is_fg = (fb_logit > 0).squeeze(1)
-                    gt_is_fg = (label_ce > 0)
-                    TP = (pred_is_fg & gt_is_fg).sum().item()
-                    FP = (pred_is_fg & (~gt_is_fg)).sum().item()
-                    FN = ((~pred_is_fg) & gt_is_fg).sum().item()
-                    TN = ((~pred_is_fg) & (~gt_is_fg)).sum().item()
-
-                    gt_fg_cnt = gt_is_fg.sum().item()
-                    gt_bg_cnt = (~gt_is_fg).sum().item()
-                    FP_rate = FP / max(gt_bg_cnt, 1)
-                    FN_rate = FN / max(gt_fg_cnt, 1)
-
-                    q_cls = torch.softmax(class_logits, dim=-1)          # (B,Q,C)
-                    p_cls_dbg = q_cls[..., 1:].mean(dim=(0, 1))          # (C-1,)
-                    p_cls_dbg = p_cls_dbg / p_cls_dbg.sum().clamp_min(1e-6)
-                    
-                    print("===== DEBUG (Conservative GT-fg Stage2 + Stop-bleeding losses) =====")
-                    print("[class_head p_cls]", p_cls_dbg.detach().cpu().numpy().round(3))
-                    print(f"GT_fg_ratio: {gt_fg_ratio:.4f} | Pred_fg_ratio(argmax): {pred_fg_ratio:.4f} | Stage1_fg_ratio: {stage1_fg_ratio:.4f}")
-                    print(f"pred_unique: {pred_unique}")
-                    print(f"[FG hist] dom_cls={fg_dom_cls}, dom_ratio={fg_dom_ratio:.3f}")
-                    print(f"[stage1] FP_rate={FP_rate:.4f} | FN_rate={FN_rate:.4f} | pos_weight={float(pos_weight.item()):.2f}")
-                    print(f"[loss] fg_bg={loss_fg_bg.item():.4f} | fg_cls={loss_fg_cls.item():.4f} | dice={loss_dice.item():.4f}")
-                    print(f"[reg] cov={loss_cov.item():.6f} | area_pen={area_pen.item():.6f} | ovlp={overlap_pen.item():.6f}")
-                    print(f"[den_raw] mean/min/max: {den_mean:.4f} / {den_min:.4f} / {den_max:.4f} | den_fg={den_fg_dbg:.4f}")
-                    print(f"[query] N_eff={N_eff:.2f} (<=Q={Q}) | area_H={float(H.item()):.3f}")
-                    print(f"[EMA] stage1_fg_ema={stage1_fg_ratio_ema:.3f} | explore_mode={explore_mode}")
-                    print(f"[stage1 calib] gt_fg_ratio={gt_fg_ratio.item():.4f} target_ratio={target_ratio.item():.4f} tau={tau.item():.3f} diff_mean={diff.mean().item():.3f}")
-                    print("=====================================================================")
-                    print("All Loss elegant")
-                    print(f"[fg_bg] loss_fg_bg={loss_fg_bg.item():.4f} | weighted={lambda_fb*loss_fg_bg.item():.6f}")
-                    print(f"[fg_cls] loss_fg_cls={loss_fg_cls.item():.4f} | weighted={lambda_cls  * loss_fg_cls.item():.6f}")
-                    print(f"[dice] loss_dice={loss_dice.item():.4f} | weighted={lambda_dice * loss_dice.item():.6f}")
-                    print(f"[cov] loss_cov={loss_cov.item():.4f} | weighted={lambda_cov  * loss_cov.item():.6f}")
-                    print(f"[area] area_pen={area_pen.item():.4f} | weighted={lambda_area * area_pen.item():.6f}")
-                    print(f"[overlap_pen] overlap_pen={overlap_pen.item():.4f} | weighted={lambda_ovlp * overlap_pen.item():.6f}")
-                    print(f"[cls_div] loss_cls_div={loss_cls_div.item():.4f} | weighted={lambda_cls_div*loss_cls_div.item():.6f}")
-                    #print(f"[bg] loss_bg={loss_bg.item():.4f} | weighted={lambda_bg * loss_bg.item():.6f}")
-                    print(f"[pix_div] loss_pix_div={loss_pix_div.item():.4f} | weighted={lambda_pix_div * loss_pix_div.item():.6f}")
-                    print(f"[pseudo] loss_pseudo={loss_pseudo.item():.4f} | weighted={lambda_pseudo * loss_pseudo.item():.6f}")
-                    #print(f"[fgcap] loss_fgcap ={loss_fgcap .item():.4f} | weighted={lambda_fgcap * loss_fgcap.item():.6f}")       
-                    
-            # ----------------------------
-            # backward / step
-            # ----------------------------
-            optimizer.zero_grad()
-            loss.backward()
-
-            if iter_num % 100 == 0:
-                with torch.no_grad():
-                    norms = []
-                    for p_ in trainable_params:
-                        if p_.grad is not None:
-                            norms.append(p_.grad.detach().norm(2))
-                    if norms:
-                        total_norm = torch.norm(torch.stack(norms), 2).item()
-                    else:
-                        total_norm = 0.0
-                print("DEBUG grad_norm (before clip):", total_norm)
-
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
-
-            # poly lr schedule (保留你原本)
-            min_lr = base_lr * 0.05
-            lr_main = min_lr + (base_lr - min_lr) * (1.0 - iter_num / max_iterations) ** 0.9
-
-            optimizer.param_groups[0]["lr"] = lr_main          # other params
-            optimizer.param_groups[1]["lr"] = lr_main * 0.1    # class_head
-
-            iter_num += 1
-
-            # ----------------------------
-            # wandb logs (補上 cov/area/ovlp)
-            # ----------------------------
-            # 這裡的 FP_rate/FN_rate 只有在 iter%100 時有算，
-            # 但你原本每 iter 都 log；為避免 undefined，這裡每 iter 也計一次簡版。
-            with torch.no_grad():
-                pred_is_fg = (fb_logit > 0).squeeze(1)
-                gt_is_fg = (label_ce > 0)
-                FP = (pred_is_fg & (~gt_is_fg)).sum().item()
-                FN = ((~pred_is_fg) & gt_is_fg).sum().item()
-                gt_fg_cnt = gt_is_fg.sum().item()
-                gt_bg_cnt = (~gt_is_fg).sum().item()
-                FP_rate = FP / max(gt_bg_cnt, 1)
-                FN_rate = FN / max(gt_fg_cnt, 1)
-
-                pred = semantic_prob.argmax(dim=1)
-                fg_pixels = pred[pred > 0]
-                if fg_pixels.numel() > 0:
-                    hist = torch.bincount(fg_pixels, minlength=num_classes).float()
-                    fg_hist = hist[1:]
-                    fg_class_ratio = fg_hist / fg_hist.sum().clamp_min(1.0)
-                    fg_dom_ratio = float(fg_class_ratio.max().item())
-                    fg_dom_cls = int(fg_class_ratio.argmax().item() + 1)
-                else:
-                    fg_dom_ratio = 0.0
-                    fg_dom_cls = -1
-
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/loss_fg_bg": loss_fg_bg.item(),
-                "train/loss_fg_cls": loss_fg_cls.item() if gt_fg.any() else 0.0,
-                "train/loss_dice": loss_dice.item(),
-
-                "train/loss_cov": loss_cov.item(),
-                "train/area_pen": area_pen.item(),
-                "train/overlap_pen": overlap_pen.item(),
-
-                "train/stage1_fg_ratio": float(pred_is_fg_stage1.mean().item()),
-                "train/FP_rate": FP_rate,
-                "train/FN_rate": FN_rate,
-
-                "train/pred_fg_ratio": float((pred > 0).float().mean().item()),
-                "train/fg_dom_ratio": fg_dom_ratio,
-                "train/fg_dom_cls": fg_dom_cls,
-
-                "train/pos_weight": float(pos_weight.item()),
-                "train/explore_mode": int(explore_mode),
-                "lr_main": lr_main,
-            })
-
-            writer.add_scalar("loss/total", loss.item(), iter_num)
-            writer.add_scalar("loss/fg_bg", loss_fg_bg.item(), iter_num)
-            writer.add_scalar("loss/fg_cls", loss_fg_cls.item(), iter_num)
-            writer.add_scalar("loss/dice", loss_dice.item(), iter_num)
-            writer.add_scalar("loss/cov", loss_cov.item(), iter_num)
-            writer.add_scalar("loss/area_pen", area_pen.item(), iter_num)
-            writer.add_scalar("loss/overlap_pen", overlap_pen.item(), iter_num)
-            writer.add_scalar("stat/stage1_fg_ratio", stage1_fg_ratio, iter_num)
-            writer.add_scalar("stat/explore_mode", int(explore_mode), iter_num)
-            writer.add_scalar("stat/pos_weight", float(pos_weight.item()), iter_num)
-            writer.add_scalar("lr_main", lr_main, iter_num)
-
-            logging.info(
-                f"iter {iter_num:5d} | "
-                f"loss={loss.item():.4f} | "
-                f"fg_bg={loss_fg_bg.item():.4f} | "
-                f"fg_cls={loss_fg_cls.item() if gt_fg.any() else 0.0:.4f} | "
-                f"dice={loss_dice.item():.4f} | "
-                f"cov={loss_cov.item():.6f} | "
-                f"area={area_pen.item():.6f} | "
-                f"ovlp={overlap_pen.item():.6f} | "
-                f"stage1_fg_ratio={stage1_fg_ratio:.4f} | "
-                f"pos_weight={float(pos_weight.item()):.2f} | "
-                f"FP_rate={FP_rate:.4f} | FN_rate={FN_rate:.4f}"
-            )
-
-            # ----------------------------
-            # wandb image vis (保留你原本)
-            # ----------------------------
-            if iter_num % 50 == 0:
-                image_show = image_batch[0, 0, :, :].cpu().detach().numpy()
-                image_show = (image_show - image_show.min()) / (image_show.max() - image_show.min() + 1e-8)
-
-                pred_mask = semantic_prob.argmax(dim=1)[0].detach().cpu().numpy()
-                gt_mask = label_ce[0].cpu().numpy()
-
-                wandb.log({
-                    "train/visualization": wandb.Image(
-                        image_show,
-                        masks={
-                            "predictions": {"mask_data": pred_mask, "class_labels": class_labels},
-                            "ground_truth": {"mask_data": gt_mask, "class_labels": class_labels}
-                        },
-                        caption=f"Epoch {epoch_num} Iter {iter_num}"
-                    )
-                })
-                writer.add_image('train/Image', image_show[None, ...], iter_num)
 
         # ================================
         # Validation Stage (保留你原本版本)
         # ================================
-        if (epoch_num % 1 == 0):
+
+        if ((epoch_num+1) % 2 == 0 and epoch_num != 0):
             model.eval()
 
             dice_per_class = {c: [] for c in range(1, args.num_classes)}
@@ -839,7 +1142,7 @@ def trainer_synapse(args, model, snapshot_path):
 
             with torch.no_grad():
                 for _, val_batch in tqdm(enumerate(valloader), total=len(valloader),
-                                         desc=f"Validating Epoch {epoch_num}"):
+                                        desc=f"Validating Epoch {epoch_num}"):
 
                     val_img = val_batch['image'].cuda()
                     val_label = val_batch['label'].cuda()

@@ -8,14 +8,14 @@ import scipy.ndimage
 # 1. 設定標籤對應
 class_labels = {
     0: "Background",
-    1: "Aorta (主動脈)",
-    2: "Gallbladder (膽囊)",
-    3: "Kidney_L (左腎)",
-    4: "Kidney_R (右腎)",
-    5: "Liver (肝臟)",
-    6: "Pancreas (胰臟)",
-    7: "Spleen (脾臟)",
-    8: "Stomach (胃)"
+    1: "Aorta",
+    2: "Gallbladder",
+    3: "Kidney_L",
+    4: "Kidney_R",
+    5: "Liver",
+    6: "Pancreas",
+    7: "Spleen",
+    8: "Stomach"
 }
 
 # 2. 定義每個類別的固定顏色
@@ -72,8 +72,14 @@ if target_file:
 
     # 右圖
     plt.subplot(1, 2, 2)
-    plt.imshow(label, cmap=custom_cmap, vmin=0, vmax=8, interpolation='nearest')
-    plt.title("Ground Truth Segmentation")
+
+    # 先畫原圖
+    plt.imshow(image, cmap='gray')
+    # 再疊 segmentation（重點在 alpha）
+    plt.imshow(label, cmap=custom_cmap, vmin=0, vmax=8,
+            interpolation='nearest', alpha=0.5)
+
+    plt.title("Overlay: CT + Segmentation")
     plt.axis('off')
 
     # --- 製作圖例與標註 ---
