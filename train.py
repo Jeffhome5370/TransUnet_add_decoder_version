@@ -148,7 +148,9 @@ if __name__ == "__main__":
     else:
         net = original_net
     if args.resume is not None:
+        print("=======================================")
         print(f"Continue trainning model {args.resume}")
+        print("=======================================")
     # -----------------------------------------------------------------
 
     trainer = {'Synapse': trainer_synapse,}
