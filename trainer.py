@@ -93,7 +93,7 @@ class PhaseScheduler:
         else:
             return 4
         
-        
+    
     def weights(self, epoch_num):
         ph = self.phase(epoch_num)
 
@@ -558,7 +558,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         enable_q_div = gate_q_div(
             num_fg_classes=num_fg_classes,
             dom_ratio=dom_ratio,
-            q10_ema=float(q10_ema.item()) if q10_ema is not None else 0.0
+            q10_ema=float(q10_ema) if q10_ema is not None else 0.0
         )
         if not enable_q_div:
             w["q_div"] = 0.0
@@ -608,6 +608,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     if iter_num % 100 == 0:
         q01, q05, q10, q50, m = log_margin_quantiles(semantic_logits2)
+        '''
         print("===== DEBUG (Phase Scheduler + Safe Controller) =====")
         print(f"[iter] {iter_num}, [epoch] {epoch_num}")
         print(f"[phase] {ph} | controller_delta={delta:+.3f} | bias={float(controller.bias.item()):.3f} | q10_now={q10_now:+.3f} | q10_ema={q10_ema:+.3f}")
@@ -628,7 +629,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         print(f"[FG CLASS STATE] num_fg_classes={num_fg_classes}")
         for c in range(1, args.num_classes):
             print(f"  class {c}: ema_ratio={class_usage_snapshot[c]:.4f}")
-
+        '''
         logging.info("===== DEBUG (Phase Scheduler + Safe Controller) =====")
         logging.info(f"[ITER] iter={iter_num} epoch={epoch_num}")
 
