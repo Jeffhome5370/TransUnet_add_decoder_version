@@ -53,6 +53,8 @@ parser.add_argument('--decoder_stride', type=int, default=4,
                     help='stride/downsample rate for transformer decoder (e.g., 2, 4, 8)')
 
 parser.add_argument('--patience', type=int, default=80, help='early_stop')
+
+parser.add_argument('--resume', type=str, default=None, help='path to checkpoint to resume')
 args = parser.parse_args()
 
 
@@ -145,6 +147,8 @@ if __name__ == "__main__":
         print(f"Total Params: {total_params/1e6:.2f}M, Trainable Params: {trainable_params/1e6:.2f}M")
     else:
         net = original_net
+    if args.resume is not None:
+        print(f"Continue trainning model {args.resume}")
     # -----------------------------------------------------------------
 
     trainer = {'Synapse': trainer_synapse,}

@@ -77,10 +77,11 @@ class PhaseScheduler:
     Phase 2: 加少量幾何正則（area/overlap 小權重）
     Phase 3: 再加 anti-collapse（cls_div / pix_div / q_div / pseudo）
     """
-    def __init__(self, p1_epochs=2, p2_epochs=30, p3_epochs=50):
+    def __init__(self, p1_epochs=2, p2_epochs=20, p3a_epochs=30, p3b_epochs=200):
         self.p1_epochs = p1_epochs
         self.p2_epochs = p2_epochs
-        self.p3_epochs = p3_epochs
+        self.p3a_epochs = p3a_epochs
+        self.p3b_epochs = p3b_epochs
 
     def phase(self, epoch_num):
         
@@ -88,11 +89,14 @@ class PhaseScheduler:
             return 1
         elif epoch_num < self.p2_epochs:
             return 2
-        elif epoch_num < self.p3_epochs:
-            return 3
+        elif epoch_num < (self.p3a_epochs):
+            return 31  # 3a         
         else:
-            return 4
+            return 32  # 3b
         
+    @staticmethod
+    def _ramp(x: float) -> float:
+        return float(max(0.0, min(1.0, x)))
     
     def weights(self, epoch_num):
         ph = self.phase(epoch_num)
@@ -125,25 +129,30 @@ class PhaseScheduler:
             w["ovlp"] = 2e-3
             w["cls_div"] = 2e-3
             w["pix_div"] = 2e-2
-        elif ph == 3:
+        elif ph == 31:
             # 最後才加分散/去塌陷
-            w["cls"]     = 0.7
+            w["cls"]     = 1.0
             w["dice"]    = 0.20
             w["area"]    = 1e-3
             w["ovlp"]    = 2e-3
-            w["cls_div"] = 5e-3
-            w["pix_div"] = 1e-2
-            w["q_div"]   = 1e-4  
+            w["cls_div"] = 0.0
+            w["pix_div"] = 0.0
+            w["q_div"]   = 0.0 
             
         else:
             # 最後才加pseudo
-            w["dice"]    = 0.20
-            w["area"]    = 2e-3
-            w["ovlp"]    = 1e-2
-            w["cls_div"] = 1e-2
-            w["pix_div"] = 2e-2
-            w["q_div"]   = 5e-4
-            w["pseudo"]  = 5e-2
+            w["cls"]  = 0.9      # 可以開始慢慢降，但別一口氣到 0.7
+            w["dice"] = 0.20
+            w["area"] = 1e-3
+            w["ovlp"] = 2e-3
+
+            # ramp span（幾個 epoch 內從 0 -> 目標值）
+            ramp_epochs = 10.0
+            t = (epoch_num - (self.p3a_epochs)) / ramp_epochs
+            r = self._ramp(t)
+            w["cls_div"] = r * 5e-3
+            w["pix_div"] = r * 1e-2
+            w["q_div"]   = r * 1e-4
 
         return ph, w
 
@@ -550,23 +559,25 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     # Regularizers (phase-gated)
     # -------------------------
+    enable_div = gate_diversity(
+        ph=ph,
+        gt_fg_ratio=gt_fg_ratio,
+        pred_fg_ratio=pred_fg_ratio,
+        stage1_fg_ratio=stage1_fg_ratio,
+        num_fg_classes=num_fg_classes,
+        dom_ratio=dom_ratio,
+        q10_ema=float(q10_ema) if q10_ema is not None else 0.0
+    )
+
+    if not enable_div:
+        w["cls_div"] = 0.0
+        w["pix_div"] = 0.0
+        w["q_div"]   = 0.0
+
     loss_area = reg_area_pen(mask_probs) if w["area"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_ovlp = reg_overlap_pen(mask_probs, den_raw, thr=2.0) if w["ovlp"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_cls_div = reg_cls_div(class_logits) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_pix_div = reg_pix_div(semantic_logits2, label_ce, fb_logit) if w["pix_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
-    if ph == 3:
-        enable_q_div = gate_q_div(
-            num_fg_classes=num_fg_classes,
-            dom_ratio=dom_ratio,
-            q10_ema=float(q10_ema) if q10_ema is not None else 0.0
-        )
-        if not enable_q_div:
-            w["q_div"] = 0.0
-
-        if pred_fg_ratio < 0.05:
-            w["cls_div"] = 0.0
-            w["pix_div"] = 0.0
-            w["q_div"] = 0.0
     loss_q_div = reg_q_div(class_logits, margin=0.9) if w["q_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
 
     # pseudo（Phase4 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
@@ -674,11 +685,12 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"pix_div={loss_pix_div.item():.6f}"
             )
 
-        if ph == 3:
+        if ph in (31, 32):
             logging.info(
                 f"[DIV] cls_div={loss_cls_div.item():.6f} "
                 f"pix_div={loss_pix_div.item():.6f} "
-                f"q_div={loss_q_div.item():.6f}"
+                f"q_div={loss_q_div.item():.6f} "
+                f"enable_div={int(enable_div)}"
             )
 
         if ph == 4:
@@ -824,6 +836,150 @@ def gate_q_div(
 
     return True
 
+def gate_diversity(
+    *,
+    ph: int,
+    gt_fg_ratio: float,
+    pred_fg_ratio: float,
+    stage1_fg_ratio: float,
+    num_fg_classes: int,
+    dom_ratio: float,
+    q10_ema: float,
+    # thresholds (可微調)
+    min_gt_fg: float = 0.005,      # 0.5%：保留極小器官，但排掉 GT=0 或太少
+    min_pred_fg: float = 0.06,     # 比你原本 0.05 稍微嚴格，避免已塌陷還開 div
+    min_stage1_fg: float = 0.04,   # stage1 太低代表 fg 偵測都不穩
+    min_classes: int = 3,          # 至少 3 類才談「多樣性」
+    max_dom: float = 0.90,         # dom 太高代表單類壟斷，先別開 div
+    q10_range: tuple = (-0.6, 0.6) # q10_ema 太極端代表 controller/分佈在震
+) -> bool:
+    # 只在 Phase3b 才開（3a 先保護 anchor）
+    if ph != 32:
+        return False
+
+    if gt_fg_ratio < min_gt_fg:
+        return False
+
+    if pred_fg_ratio < min_pred_fg:
+        return False
+
+    if stage1_fg_ratio < min_stage1_fg:
+        return False
+
+    if num_fg_classes < min_classes:
+        return False
+
+    if dom_ratio > max_dom:
+        return False
+
+    if not (q10_range[0] <= q10_ema <= q10_range[1]):
+        return False
+
+    return True
+
+@torch.no_grad()
+def validate_synapse(
+    model: torch.nn.Module,
+    valloader,
+    args,
+    writer=None,
+    epoch_num: int = 0,
+    device: str = "cuda",
+    do_wandb: bool = True,
+):
+    """
+    Validation: slice-level, GT-only dice (你的原本邏輯不變)
+    - 逐 slice 計算：每一類別若該 slice GT=0 則略過
+    - 每 slice 的 dice = 有 GT 的類別 dice 平均
+    - 最終 mean dice = 所有有 GT 的 slices 平均
+    """
+    model.eval()
+
+    dice_per_class = {c: [] for c in range(1, args.num_classes)}
+    dice_per_slice = []
+
+    for _, val_batch in tqdm(enumerate(valloader), total=len(valloader),
+                             desc=f"Validating Epoch {epoch_num}"):
+
+        val_img = val_batch["image"].to(device)
+        val_label = val_batch["label"].to(device)
+
+        # --- normalize label to (B,H,W) long ---
+        if val_label.dim() == 4 and val_label.size(1) == 1:
+            val_label_ce = val_label.squeeze(1)
+        elif val_label.dim() == 3:
+            val_label_ce = val_label
+        elif val_label.dim() == 5:
+            val_label_ce = val_label.squeeze(2)
+            if val_label_ce.dim() == 4 and val_label_ce.size(1) == 1:
+                val_label_ce = val_label_ce.squeeze(1)
+        else:
+            val_label_ce = val_label
+        val_label_ce = val_label_ce.long()
+
+        # --- forward ---
+        if args.add_decoder:
+            # eval 回 (None, prob) 你原本的處理保留
+            _, val_out = model(val_img)
+            val_out = val_out + 1e-7
+            val_out = val_out / (val_out.sum(dim=1, keepdim=True).clamp_min(1e-6))
+        else:
+            val_out = model(val_img)
+            val_out = torch.softmax(val_out, dim=1)
+
+        if val_out.dim() == 3:
+            val_out = val_out.unsqueeze(0)
+
+        pred = val_out.argmax(dim=1)  # (B,H,W)
+
+        # --- dice ---
+        dices_this_slice = []
+        for cls in range(1, args.num_classes):
+            gt = (val_label_ce == cls)
+            if gt.sum() == 0:
+                continue
+            pd = (pred == cls)
+            inter = (gt & pd).sum().float()
+            dice = (2 * inter) / (gt.sum() + pd.sum() + 1e-5)
+
+            dice_per_class[cls].append(float(dice.item()))
+            dices_this_slice.append(float(dice.item()))
+
+        if len(dices_this_slice) > 0:
+            dice_per_slice.append(sum(dices_this_slice) / len(dices_this_slice))
+
+    # --- aggregate ---
+    class_mean = {}
+    for cls, dices in dice_per_class.items():
+        class_mean[cls] = (float(np.mean(dices)) if len(dices) > 0 else None)
+
+    avg_val_dice = float(np.mean(dice_per_slice)) if len(dice_per_slice) > 0 else 0.0
+
+    # --- logging / wandb / tensorboard ---
+    print("===== Validation Per-class Dice =====")
+    for cls in range(1, args.num_classes):
+        m = class_mean[cls]
+        if m is None:
+            print(f"class {cls}: N/A (n=0)")
+        else:
+            print(f"class {cls}: {m:.4f} (n={len(dice_per_class[cls])})")
+
+    print(f"===== Validation mean dice (slice-level, GT-only) = {avg_val_dice:.6f} =====")
+
+    if do_wandb:
+        wandb.log({
+            "val/mean_dice_gt_only": avg_val_dice,
+            **{f"val/dice_class_{cls}": (class_mean[cls] if class_mean[cls] is not None else 0.0)
+               for cls in range(1, args.num_classes)},
+            "epoch": epoch_num
+        })
+
+    if writer is not None:
+        writer.add_scalar("info/val_dice", avg_val_dice, epoch_num)
+
+    logging.info("Epoch %d : Validation Mean Dice: %f", epoch_num, avg_val_dice)
+
+    return avg_val_dice, class_mean
 '''
 
 
@@ -1239,6 +1395,53 @@ def trainer_synapse(args, model, snapshot_path):
         ],
         weight_decay=1e-4
     )
+    # ----------------------------
+    # Resume from Phase2 checkpoint (or any ckpt)
+    resume_path = getattr(args, "resume", None)  # 你可以用 argparse 新增 --resume
+    start_epoch = 0
+
+    if resume_path is not None and os.path.isfile(resume_path):
+        ckpt = torch.load(resume_path, map_location="cuda")
+
+        # 1) model
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        logging.info(f"[RESUME] Loaded model from {resume_path}")
+        logging.info(f"[RESUME] missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+
+        # 2) optimizer（可選，但建議同時載入以保持動量/AdamW 狀態）
+        if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                logging.info("[RESUME] Optimizer state loaded.")
+            except Exception as e:
+                logging.info(f"[RESUME] Optimizer load failed -> {e} (will continue with fresh optimizer)")
+
+        # 3) iter / epoch
+        iter_num = int(ckpt.get("iter", 0))
+        start_epoch = int(ckpt.get("epoch", -1)) + 1  # 從下一個 epoch 接著跑
+        logging.info(f"[RESUME] iter_num={iter_num}, start_epoch={start_epoch}")
+
+        # 4) training states
+        if "class_usage_ema" in ckpt and ckpt["class_usage_ema"] is not None:
+            class_usage_ema = ckpt["class_usage_ema"].to(device)
+            logging.info("[RESUME] class_usage_ema restored.")
+
+        if "tau_ema" in ckpt:  # tau_ema_state 可能是 tensor / dict / None
+            tau_ema_state = ckpt["tau_ema"]
+            # 如果是 tensor，確保在 cuda
+            if isinstance(tau_ema_state, torch.Tensor):
+                tau_ema_state = tau_ema_state.to(device)
+            logging.info("[RESUME] tau_ema_state restored.")
+
+        if "bg_bias" in ckpt and ckpt["bg_bias"] is not None:
+            # 你的 ckpt 存的是 controller.bias（可能是 tensor）
+            controller.bias = ckpt["bg_bias"].detach().to(device)
+            logging.info(f"[RESUME] controller.bias restored: {float(controller.bias.item()):+.4f}")
+
+    else:
+        iter_num = 0
+        start_epoch = 0
+
     trainable_params = other_trainable_params + class_head_params
 
     print("Trainable param tensors (other):", len(other_trainable_params))
@@ -1278,13 +1481,15 @@ def trainer_synapse(args, model, snapshot_path):
     # pix_div schedule: first epoch smaller
     # (we keep your original behavior: epoch<1 => 0.02 else 0.08)
 
-    iter_num = 0
+    #iter_num = 0
     best_performance = 0.0
 
     p1_epochs=2
     p2_epochs=20
-    p3_epochs=50
-    phase_sched = PhaseScheduler(p1_epochs=p1_epochs, p2_epochs=p2_epochs, p3_epochs=p3_epochs)
+    p3a_epochs=30
+    p3b_epochs=200
+
+    phase_sched = PhaseScheduler(p1_epochs=p1_epochs, p2_epochs=p2_epochs, p3a_epochs=p3a_epochs, p3b_epochs=p3b_epochs)
     controller = BgBiasController(
         init_bias=0.0,
         max_bias=20.0,      # 先放大，因為你 margin 會到 +3，max_bias=2 根本不夠
@@ -1293,16 +1498,28 @@ def trainer_synapse(args, model, snapshot_path):
         step_clip=0.12,     # 單步最大調整（止血用，之後可再縮）
         ema_w=1.0
     )
-
-    tau_ema_state = None
-    cls_count_ema = None
+    if resume_path is None:
+        tau_ema_state = None
+        cls_count_ema = None
 
 
 
     max_iterations = args.max_epochs * len(trainloader)
     logging.info(f"{len(trainloader)} iterations per epoch. {max_iterations} max iterations")
 
-    iterator = tqdm(range(max_epoch), ncols=70)
+    iterator = iterator = tqdm(range(start_epoch, max_epoch), ncols=70)
+
+    if resume_path is not None:
+        best_performance, _ = validate_synapse(
+            model=model,
+            valloader=valloader,
+            args=args,
+            writer=None,
+            epoch_num=start_epoch - 1,
+            device="cuda",
+            do_wandb=False
+        )
+        logging.info(f"[RESUME] init best_performance = {best_performance:.6f}")
 
     for epoch_num in iterator:
         model.train()
@@ -1318,7 +1535,7 @@ def trainer_synapse(args, model, snapshot_path):
             # ----------------------------
             # forward: model -> (class_logits, masks[-1]) -> mask_probs/den
             # ----------------------------
-            iter_num, tau_ema_state, cls_count_ema, class_usage_ema = training_step_core(
+            iter_num, tau_ema_state, cls_count_ema, class_usage_ema= training_step_core(
                 args, model, dice_loss, optimizer, writer, wandb,
                 class_labels,
                 iter_num,
@@ -1365,7 +1582,23 @@ def trainer_synapse(args, model, snapshot_path):
             torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
         
-        if epoch_num == p3_epochs - 1:
+        if epoch_num == p3a_epochs - 1:
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),   # 可選
+                "iter": iter_num,
+                "epoch": epoch_num,
+
+                # ===== training state =====
+                "class_usage_ema": class_usage_ema,
+                "tau_ema": tau_ema_state,
+                "bg_bias": controller.bias,
+            }
+            save_mode_path = os.path.join(snapshot_path, 'phase3_epoch_' + str(epoch_num) + '.pth')
+            torch.save(ckpt, save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+
+        if epoch_num == p3b_epochs - 1:
             ckpt = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),   # 可選
@@ -1384,91 +1617,32 @@ def trainer_synapse(args, model, snapshot_path):
         # Validation Stage (保留你原本版本)
         # ================================
 
-        if ((epoch_num+1) % 5 == 0 and epoch_num != 0):
-            model.eval()
+        if ((epoch_num + 1) % 5 == 0 and epoch_num != 0):
+            avg_val_dice, class_mean = validate_synapse(
+                model=model,
+                valloader=valloader,
+                args=args,
+                writer=writer,
+                epoch_num=epoch_num,
+                device="cuda",
+                do_wandb=True
+            )
 
-            dice_per_class = {c: [] for c in range(1, args.num_classes)}
-            dice_per_slice = []
-
-            with torch.no_grad():
-                for _, val_batch in tqdm(enumerate(valloader), total=len(valloader),
-                                        desc=f"Validating Epoch {epoch_num}"):
-
-                    val_img = val_batch['image'].cuda()
-                    val_label = val_batch['label'].cuda()
-
-                    if val_label.dim() == 4 and val_label.size(1) == 1:
-                        val_label_ce = val_label.squeeze(1)
-                    elif val_label.dim() == 3:
-                        val_label_ce = val_label
-                    elif val_label.dim() == 5:
-                        val_label_ce = val_label.squeeze(2)
-                        if val_label_ce.dim() == 4 and val_label_ce.size(1) == 1:
-                            val_label_ce = val_label_ce.squeeze(1)
-                    else:
-                        val_label_ce = val_label
-                    val_label_ce = val_label_ce.long()
-
-                    if args.add_decoder:
-                        _, val_out = model(val_img)  # eval 回 (None, prob)
-                        val_out = val_out + 1e-7
-                        val_out = val_out / (val_out.sum(dim=1, keepdim=True).clamp_min(1e-6))
-                    else:
-                        val_out = model(val_img)
-                        val_out = torch.softmax(val_out, dim=1)
-
-                    if val_out.dim() == 3:
-                        val_out = val_out.unsqueeze(0)
-
-                    pred = val_out.argmax(dim=1)
-
-                    dices_this_slice = []
-                    for cls in range(1, args.num_classes):
-                        gt = (val_label_ce == cls)
-                        if gt.sum() == 0:
-                            continue
-                        pd = (pred == cls)
-                        inter = (gt & pd).sum().float()
-                        dice = (2 * inter) / (gt.sum() + pd.sum() + 1e-5)
-
-                        dice_per_class[cls].append(dice.item())
-                        dices_this_slice.append(dice.item())
-
-                    if len(dices_this_slice) > 0:
-                        dice_per_slice.append(sum(dices_this_slice) / len(dices_this_slice))
-
-            print("===== Validation Per-class Dice =====")
-            class_mean = {}
-            for cls, dices in dice_per_class.items():
-                if len(dices) == 0:
-                    print(f"class {cls}: N/A (n=0)")
-                    class_mean[cls] = None
-                else:
-                    m = float(np.mean(dices))
-                    print(f"class {cls}: {m:.4f} (n={len(dices)})")
-                    class_mean[cls] = m
-
-            avg_val_dice = float(np.mean(dice_per_slice)) if len(dice_per_slice) > 0 else 0.0
-            print(f"===== Validation mean dice (slice-level, GT-only) = {avg_val_dice:.6f} =====")
-
-            wandb.log({
-                "val/mean_dice_gt_only": avg_val_dice,
-                **{f"val/dice_class_{cls}": (m if m is not None else 0.0) for cls, m in class_mean.items()},
-                "epoch": epoch_num
-            })
-            writer.add_scalar('info/val_dice', avg_val_dice, epoch_num)
-            logging.info('Epoch %d : Validation Mean Dice: %f' % (epoch_num, avg_val_dice))
-
+            # best model
             if avg_val_dice > best_performance:
                 best_performance = avg_val_dice
-                save_best_path = os.path.join(snapshot_path, 'best_model.pth')
+                save_best_path = os.path.join(snapshot_path, "best_model.pth")
 
                 if args.n_gpu > 1:
                     torch.save(model.module.state_dict(), save_best_path)
                 else:
                     torch.save(model.state_dict(), save_best_path)
 
-                logging.info("######## Saved new best model (Dice: {:.4f}) to {} ########".format(best_performance, save_best_path))
+                logging.info(
+                    "######## Saved new best model (Dice: {:.4f}) to {} ########".format(
+                        best_performance, save_best_path
+                    )
+                )
                 wandb.run.summary["best_val_dice"] = best_performance
 
         # periodic save
