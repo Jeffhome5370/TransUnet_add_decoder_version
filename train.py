@@ -94,6 +94,15 @@ if __name__ == "__main__":
     snapshot_path = snapshot_path + '_lr' + str(args.base_lr) if args.base_lr != 0.01 else snapshot_path
     snapshot_path = snapshot_path + '_'+str(args.img_size)
     snapshot_path = snapshot_path + '_s'+str(args.seed) if args.seed!=1234 else snapshot_path
+    if args.resume is not None:
+        if "phase2" in str(args.resume):
+            snapshot_path = snapshot_path + '_FromPhase2'
+        elif "phase31" in str(args.resume):
+            snapshot_path = snapshot_path + '_FromPhase31'
+        else:
+            snapshot_path = snapshot_path + '_FromPhase32'
+    else:    
+        snapshot_path = snapshot_path
 
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
