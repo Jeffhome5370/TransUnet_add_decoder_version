@@ -140,7 +140,7 @@ class PhaseScheduler:
             w["q_div"]   = 0.0 
             
         else:
-            # 最後才加pseudo
+            
             w["cls"]  = 0.9      # 可以開始慢慢降，但別一口氣到 0.7
             w["dice"] = 0.20
             w["area"] = 1e-3
@@ -1593,7 +1593,7 @@ def trainer_synapse(args, model, snapshot_path):
                 "tau_ema": tau_ema_state,
                 "bg_bias": controller.bias,
             }
-            save_mode_path = os.path.join(snapshot_path, 'phase3_epoch_' + str(epoch_num) + '.pth')
+            save_mode_path = os.path.join(snapshot_path, 'phase31_epoch_' + str(epoch_num) + '.pth')
             torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
 
@@ -1609,7 +1609,7 @@ def trainer_synapse(args, model, snapshot_path):
                 "tau_ema": tau_ema_state,
                 "bg_bias": controller.bias,
             }
-            save_mode_path = os.path.join(snapshot_path, 'phase3_epoch_' + str(epoch_num) + '.pth')
+            save_mode_path = os.path.join(snapshot_path, 'phase32_epoch_' + str(epoch_num) + '.pth')
             torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
         # ================================
