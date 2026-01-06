@@ -1338,7 +1338,7 @@ def trainer_synapse(args, model, snapshot_path):
     base_lr = args.base_lr
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
-    max_epoch = args.max_epochs
+    #max_epoch = args.max_epochs
     device = "cuda"
     class_usage_ema = torch.zeros(num_classes, device=device)
     class_usage_mom = 0.95
@@ -1502,7 +1502,7 @@ def trainer_synapse(args, model, snapshot_path):
         start_epoch = 0
         tau_ema_state = None
         cls_count_ema = None
-
+    max_epoch = args.max_epochs + start_epoch
     max_iterations = args.max_epochs * len(trainloader)
     logging.info(f"{len(trainloader)} iterations per epoch. {max_iterations} max iterations")
 
