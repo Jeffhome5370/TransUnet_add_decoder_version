@@ -1400,47 +1400,7 @@ def trainer_synapse(args, model, snapshot_path):
     resume_path = getattr(args, "resume", None)  # 你可以用 argparse 新增 --resume
     start_epoch = 0
 
-    if resume_path is not None and os.path.isfile(resume_path):
-        ckpt = torch.load(resume_path, map_location="cuda")
-
-        # 1) model
-        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        logging.info(f"[RESUME] Loaded model from {resume_path}")
-        logging.info(f"[RESUME] missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
-
-        # 2) optimizer（可選，但建議同時載入以保持動量/AdamW 狀態）
-        if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer"])
-                logging.info("[RESUME] Optimizer state loaded.")
-            except Exception as e:
-                logging.info(f"[RESUME] Optimizer load failed -> {e} (will continue with fresh optimizer)")
-
-        # 3) iter / epoch
-        iter_num = int(ckpt.get("iter", 0))
-        start_epoch = int(ckpt.get("epoch", -1)) + 1  # 從下一個 epoch 接著跑
-        logging.info(f"[RESUME] iter_num={iter_num}, start_epoch={start_epoch}")
-
-        # 4) training states
-        if "class_usage_ema" in ckpt and ckpt["class_usage_ema"] is not None:
-            class_usage_ema = ckpt["class_usage_ema"].to(device)
-            logging.info("[RESUME] class_usage_ema restored.")
-
-        if "tau_ema" in ckpt:  # tau_ema_state 可能是 tensor / dict / None
-            tau_ema_state = ckpt["tau_ema"]
-            # 如果是 tensor，確保在 cuda
-            if isinstance(tau_ema_state, torch.Tensor):
-                tau_ema_state = tau_ema_state.to(device)
-            logging.info("[RESUME] tau_ema_state restored.")
-
-        if "bg_bias" in ckpt and ckpt["bg_bias"] is not None:
-            # 你的 ckpt 存的是 controller.bias（可能是 tensor）
-            controller.bias = ckpt["bg_bias"].detach().to(device)
-            logging.info(f"[RESUME] controller.bias restored: {float(controller.bias.item()):+.4f}")
-
-    else:
-        iter_num = 0
-        start_epoch = 0
+    
 
     trainable_params = other_trainable_params + class_head_params
 
@@ -1498,11 +1458,50 @@ def trainer_synapse(args, model, snapshot_path):
         step_clip=0.12,     # 單步最大調整（止血用，之後可再縮）
         ema_w=1.0
     )
-    if resume_path is None:
+
+    if resume_path is not None and os.path.isfile(resume_path):
+        ckpt = torch.load(resume_path, map_location="cuda")
+
+        # 1) model
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        logging.info(f"[RESUME] Loaded model from {resume_path}")
+        logging.info(f"[RESUME] missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+
+        # 2) optimizer（可選，但建議同時載入以保持動量/AdamW 狀態）
+        if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                logging.info("[RESUME] Optimizer state loaded.")
+            except Exception as e:
+                logging.info(f"[RESUME] Optimizer load failed -> {e} (will continue with fresh optimizer)")
+
+        # 3) iter / epoch
+        iter_num = int(ckpt.get("iter", 0))
+        start_epoch = int(ckpt.get("epoch", -1)) + 1  # 從下一個 epoch 接著跑
+        logging.info(f"[RESUME] iter_num={iter_num}, start_epoch={start_epoch}")
+
+        # 4) training states
+        if "class_usage_ema" in ckpt and ckpt["class_usage_ema"] is not None:
+            class_usage_ema = ckpt["class_usage_ema"].to(device)
+            logging.info("[RESUME] class_usage_ema restored.")
+
+        if "tau_ema" in ckpt:  # tau_ema_state 可能是 tensor / dict / None
+            tau_ema_state = ckpt["tau_ema"]
+            # 如果是 tensor，確保在 cuda
+            if isinstance(tau_ema_state, torch.Tensor):
+                tau_ema_state = tau_ema_state.to(device)
+            logging.info("[RESUME] tau_ema_state restored.")
+
+        if "bg_bias" in ckpt and ckpt["bg_bias"] is not None:
+            # 你的 ckpt 存的是 controller.bias（可能是 tensor）
+            controller.bias = ckpt["bg_bias"].detach().to(device)
+            logging.info(f"[RESUME] controller.bias restored: {float(controller.bias.item()):+.4f}")
+
+    else:
+        iter_num = 0
+        start_epoch = 0
         tau_ema_state = None
         cls_count_ema = None
-
-
 
     max_iterations = args.max_epochs * len(trainloader)
     logging.info(f"{len(trainloader)} iterations per epoch. {max_iterations} max iterations")
