@@ -891,7 +891,7 @@ def gate_diversity(
     - 只針對 ph==32（Phase3b）做 gating。其他 phase 回傳 0。
     - 「前景膨脹」優先級最高：一票否決 div，避免把錯誤 FG 做多類別均勻化。
     """
-    if ph != 32 or ph != 31:
+    if ph not in (31, 32):
         return 0
 
     # ---------- Mode 2: FG inflation (highest priority) ----------
