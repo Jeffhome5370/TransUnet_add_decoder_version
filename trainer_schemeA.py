@@ -112,6 +112,7 @@ class PhaseScheduler:
             "cls_div": 0.0,
             "pix_div": 0.0,
             "q_div": 0.0,
+            "infl": 0.0,
             "pseudo": 0.0,
         }
 
@@ -119,7 +120,7 @@ class PhaseScheduler:
             # 輕微正則：只求先學會不塌
             w["dice"] = 0.10
             w["cls_div"] = 2e-3   # 原本 phase3=1e-2，這裡先 1/5
-            w["pix_div"] = 6e-3   # 原本 phase3=2e-2，這裡先 1/4
+            w["pix_div"] = 0.0   # (方案A) Synapse: 移除 pix_div，避免錯誤 FG mask 扭曲分佈
             
         elif ph == 2:
             # 輕量幾何（先寬鬆、權重小）
@@ -128,7 +129,7 @@ class PhaseScheduler:
             w["area"] = 1e-3
             w["ovlp"] = 2e-3
             w["cls_div"] = 2e-3
-            w["pix_div"] = 2e-2
+            w["pix_div"] = 0.0  # (方案A) disable pix_div
         elif ph == 31:
             # 最後才加分散/去塌陷
             w["cls"]     = 1.2
@@ -136,8 +137,9 @@ class PhaseScheduler:
             w["area"]    = 1e-3
             w["ovlp"]    = 2e-3
             w["cls_div"] = 0.0
-            w["pix_div"] = 1e-3
+            w["pix_div"] = 0.0  # (方案A) disable pix_div
             w["q_div"]   = 1e-5 
+            w["infl"]    = 5e-2
             
         else:
             
@@ -150,9 +152,10 @@ class PhaseScheduler:
             ramp_epochs = 10.0
             t = (epoch_num - (self.p3a_epochs)) / ramp_epochs
             r = self._ramp(t)
-            w["cls_div"] = r * 5e-3
-            w["pix_div"] = r * 1e-2
-            w["q_div"]   = r * 1e-4
+            w["cls_div"] = r * 2e-3  # (方案A) KL-to-prior, keep small
+            w["pix_div"] = 0.0  # (方案A) disable pix_div
+            w["q_div"]   = r * 2e-5  # (方案A) anti-collapse only, keep tiny
+            w["infl"]    = 5e-2   # (方案A) 前景膨脹抑制（只在 inflation mode 啟用）
 
         return ph, w
 
@@ -365,15 +368,25 @@ def reg_overlap_pen(mask_probs, den_raw, thr=2.0):
     # 門檻寬鬆，不要早期把 den 壓死
     return F.relu(den_raw - thr).pow(2).mean()
 
-def reg_cls_div(class_logits):
+def reg_cls_div(class_logits, cls_count_ema, eps: float = 1e-3):
     """
-    batch-level KL(p||U) on FG classes (queries averaged)
+    (方案A) GT-prior matching instead of uniform.
+    batch-level KL(p_pred_fg || p_prior_fg)
+
+    - p_pred_fg: FG class distribution averaged over (B,Q)
+    - p_prior_fg: normalized EMA of GT counts (cls_count_ema, shape=(8,))
     """
-    q = torch.softmax(class_logits, dim=-1)  # (B,Q,C)
-    p = q[..., 1:].mean(dim=(0, 1))          # (C-1,)
-    p = p / p.sum().clamp_min(1e-6)
-    u = torch.full_like(p, 1.0 / p.numel())
-    return torch.sum(p * (p.clamp_min(1e-6).log() - u.log()))
+    # Pred FG distribution from queries
+    q = torch.softmax(class_logits, dim=-1)           # (B,Q,C)
+    p = q[..., 1:].mean(dim=(0, 1))                   # (C-1,)
+    p = (p + eps) / (p.sum() + eps * p.numel())
+
+    # GT prior (EMA) over FG classes
+    prior = cls_count_ema.detach().float().clamp_min(0.0)
+    prior = prior + eps
+    prior = prior / prior.sum().clamp_min(1e-6)
+
+    return torch.sum(p * (p.log() - prior.log()))
 
 def reg_pix_div(semantic_logits2, label_ce, fb_logit):
     """
@@ -419,6 +432,16 @@ def reg_q_div(class_logits, margin=0.9):
     sim_off = sim * (1.0 - eye)
     return torch.relu(sim_off - margin).pow(2).mean()
 
+
+
+def reg_fg_inflation(pred_fg_ratio: float, gt_fg_ratio: float, device, ratio_thr: float = 3.0, min_gt: float = 0.005):
+    """
+    (方案A) 前景膨脹抑制：當 pred_fg_ratio 明顯大於 GT 時，施加懲罰。
+    penalty = ReLU(pred_fg_ratio - ratio_thr * max(gt_fg_ratio, min_gt))^2
+    """
+    target = ratio_thr * max(gt_fg_ratio, min_gt)
+    excess = max(0.0, pred_fg_ratio - target)
+    return torch.tensor(excess * excess, device=device)
 # -------------------------
 # Wandb image logger (every N iters)
 # -------------------------
@@ -559,7 +582,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     # Regularizers (phase-gated)
     # -------------------------
-    enable_div = gate_diversity(
+    div_mode = gate_diversity(
         ph=ph,
         gt_fg_ratio=gt_fg_ratio,
         pred_fg_ratio=pred_fg_ratio,
@@ -569,16 +592,21 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         q10_ema=float(q10_ema) if q10_ema is not None else 0.0
     )
 
-    if not enable_div:
+    # (方案A) 3-state gating (only for ph==32)
+    # div_mode: 0=normal, 1=collapse (enable cls_div/q_div), 2=inflation (enable infl only)
+    if div_mode != 1:
         w["cls_div"] = 0.0
         w["pix_div"] = 0.0
         w["q_div"]   = 0.0
+    if div_mode != 2:
+        w["infl"]    = 0.0
 
     loss_area = reg_area_pen(mask_probs) if w["area"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_ovlp = reg_overlap_pen(mask_probs, den_raw, thr=2.0) if w["ovlp"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
-    loss_cls_div = reg_cls_div(class_logits) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
-    loss_pix_div = reg_pix_div(semantic_logits2, label_ce, fb_logit) if w["pix_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_cls_div = reg_cls_div(class_logits, cls_count_ema) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_pix_div = torch.tensor(0.0, device=semantic_logits2.device)  # (方案A) pix_div removed
     loss_q_div = reg_q_div(class_logits, margin=0.9) if w["q_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_infl = reg_fg_inflation(pred_fg_ratio, gt_fg_ratio, semantic_logits2.device) if w["infl"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
 
     # pseudo（Phase4 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
     loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
@@ -595,6 +623,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         w["cls_div"] * loss_cls_div +
         w["pix_div"] * loss_pix_div +
         w["q_div"] * loss_q_div +
+        w["infl"] * loss_infl +
         w["pseudo"] * loss_pseudo
     )
 
@@ -690,7 +719,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"[DIV] cls_div={loss_cls_div.item():.6f} "
                 f"pix_div={loss_pix_div.item():.6f} "
                 f"q_div={loss_q_div.item():.6f} "
-                f"enable_div={int(enable_div)}"
+                f"div_mode={int(div_mode)}"
             )
 
         if ph == 4:
@@ -846,36 +875,43 @@ def gate_diversity(
     dom_ratio: float,
     q10_ema: float,
     # thresholds (可微調)
-    min_gt_fg: float = 0.005,      # 0.5%：保留極小器官，但排掉 GT=0 或太少
-    min_pred_fg: float = 0.06,     # 比你原本 0.05 稍微嚴格，避免已塌陷還開 div
-    min_stage1_fg: float = 0.04,   # stage1 太低代表 fg 偵測都不穩
-    min_classes: int = 3,          # 至少 3 類才談「多樣性」
-    max_dom: float = 0.90,         # dom 太高代表單類壟斷，先別開 div
-    q10_range: tuple = (-0.6, 0.6) # q10_ema 太極端代表 controller/分佈在震
-) -> bool:
-    # 只在 Phase3b 才開（3a 先保護 anchor）
-    if ph != 32:
-        return False
+    min_gt_fg: float = 0.005,
+    inflation_ratio_thr: float = 3.0,
+    inflation_pred_abs: float = 0.20,
+    collapse_min_classes: int = 3,
+    collapse_dom_thr: float = 0.90,
+) -> int:
+    """
+    (方案A) Phase3b gating: return mode
+      0 = normal (div off)
+      1 = semantic-collapse (enable anti-collapse only: cls_div KL-to-prior + tiny q_div)
+      2 = fg-inflation (div must be OFF; enable inflation penalty)
 
+    Notes:
+    - 只針對 ph==32（Phase3b）做 gating。其他 phase 回傳 0。
+    - 「前景膨脹」優先級最高：一票否決 div，避免把錯誤 FG 做多類別均勻化。
+    """
+    if ph != 32 or ph != 31:
+        return 0
+
+    # ---------- Mode 2: FG inflation (highest priority) ----------
+    ratio = pred_fg_ratio / (gt_fg_ratio + 1e-6) if gt_fg_ratio > 0 else (1e9 if pred_fg_ratio > 0 else 0.0)
+    if (pred_fg_ratio >= inflation_pred_abs and ratio >= inflation_ratio_thr) or (pred_fg_ratio >= 0.60 and gt_fg_ratio <= 0.15):
+        return 2
+
+    # ---------- Mode 1: semantic collapse ----------
+    # Only consider collapse when there is enough GT FG signal; otherwise skip.
     if gt_fg_ratio < min_gt_fg:
-        return False
+        return 0
 
-    if pred_fg_ratio < min_pred_fg:
-        return False
+    collapse = (num_fg_classes < collapse_min_classes) or (dom_ratio >= collapse_dom_thr)
 
-    if stage1_fg_ratio < min_stage1_fg:
-        return False
+    # stage1 too low => fg detection unstable; do not enable div (leave to controller/CE)
+    if stage1_fg_ratio < 0.03:
+        return 0
 
-    if num_fg_classes < min_classes:
-        return False
+    return 1 if collapse else 0
 
-    if dom_ratio > max_dom:
-        return False
-
-    if not (q10_range[0] <= q10_ema <= q10_range[1]):
-        return False
-
-    return True
 
 @torch.no_grad()
 def validate_synapse(

@@ -9,7 +9,7 @@ import wandb
 from networks.vit_seg_modeling import VisionTransformer as ViT_seg
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from networks.vit_seg_modeling import TransUNet_TransformerDecoder
-from trainer import trainer_synapse
+from trainer_schemeA import trainer_synapse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
