@@ -39,6 +39,8 @@ files = os.listdir(data_path)
 target_file = None
 print("正在搜尋包含多個器官的切片...")
 
+count = 0
+total = 0
 for filename in files:
     data = np.load(os.path.join(data_path, filename))
     # ▼▼▼▼▼▼▼ 修正點在這裡 ▼▼▼▼▼▼▼
@@ -47,7 +49,7 @@ for filename in files:
     # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
     
     unique_classes = np.unique(label)
-    
+
     if len(unique_classes) == 9:
         target_file = filename
         print(f"找到目標檔案: {filename}")

@@ -57,6 +57,8 @@ def dice_softmax_loss(dice_loss_fn, semantic_logits, label_ce):
     prob = torch.softmax(semantic_logits, dim=1)
     return dice_loss_fn(prob, label_ce, softmax=False)
 
+
+
 @torch.no_grad()
 def log_margin_quantiles(semantic_logits):
     bg = semantic_logits[:, 0]
@@ -78,7 +80,7 @@ class PhaseScheduler:
     Phase 2: 加少量幾何正則（area/overlap 小權重）
     Phase 3: 再加 anti-collapse（cls_div / pix_div / q_div / pseudo）
     """
-    def __init__(self, p1_epochs=2, p2_epochs=20, p3a_epochs=30, p3b_epochs=200,
+    def __init__(self, p1_epochs=2, p2_epochs=20, p3_dice_epochs=31, p3a_epochs=100, p3b_epochs=200,
                  p3_ready_window: int = 400,
                  p3_ready_min_samples: int = 200,
                  p3_ratio_med_thr: float = 2.0,
@@ -91,6 +93,7 @@ class PhaseScheduler:
                  infl_max_scale: float = 4.0):
         self.p1_epochs = p1_epochs
         self.p2_epochs = p2_epochs
+        self.p3_dice_epochs = p3_dice_epochs
         self.p3a_epochs = p3a_epochs
         self.p3b_epochs = p3b_epochs
 
@@ -126,9 +129,7 @@ class PhaseScheduler:
         # Phase3: indicator-based gating
         # - If unlocked, phase=32 starts from _p3b_start_epoch
         # - Otherwise, stay in 31 until reaching the upper bound p3a_epochs
-        if self._p3b_start_epoch is not None and epoch_num >= self._p3b_start_epoch:
-            return 32
-        elif epoch_num < self.p3a_epochs:
+        if epoch_num < self.p3a_epochs:
             return 31
         else:
             return 32
@@ -153,6 +154,7 @@ class PhaseScheduler:
             "q_div": 0.0,
             "infl": 0.0,
             "pseudo": 0.0,
+            "bgm":0.0
         }
 
         if ph == 1:
@@ -171,13 +173,15 @@ class PhaseScheduler:
             w["pix_div"] = 0.0  # (方案A) disable pix_div
         elif ph == 31:
             # 最後才加分散/去塌陷
-            w["cls"]     = 1.2
+            w["cls"]     = 1.0
             w["dice"]    = 0.15
             w["area"]    = 1e-3
             w["ovlp"]    = 2e-3
             w["cls_div"] = 0.0
             w["pix_div"] = 0.0  # (方案A) disable pix_div
-            w["q_div"]   = 1e-5 
+            w["q_div"]   = 1e-5
+            w["infl"]    = 0.1 #（只在 inflation mode 啟用）
+            w["bgm"] = 0.6
             
         else:
             
@@ -185,16 +189,17 @@ class PhaseScheduler:
             w["dice"] = 0.20
             w["area"] = 1e-3
             w["ovlp"] = 2e-3
+            w["bgm"] = 0.6
 
             # ramp span（幾個 epoch 內從 0 -> 目標值）
             ramp_epochs = 10.0
-            p3b_start = self._p3b_start_epoch if self._p3b_start_epoch is not None else self.p3a_epochs
+            p3b_start = self.p3b_epochs
             t = (epoch_num - p3b_start) / ramp_epochs
             r = self._ramp(t)
             w["cls_div"] = r * 2e-3  # (方案A) KL-to-prior, keep small
             w["pix_div"] = 0.0  # (方案A) disable pix_div
             w["q_div"]   = r * 2e-5  # (方案A) anti-collapse only, keep tiny
-            w["infl"]    = 5e-2   # (方案A) 前景膨脹抑制（只在 inflation mode 啟用）
+            w["infl"]    = 0.1      # (方案A) 前景膨脹抑制（只在 inflation mode 啟用）
 
         return ph, w
 
@@ -203,7 +208,9 @@ class PhaseScheduler:
         if self._p3b_start_epoch is not None:
             return min(self.p3a_epochs - 1, self._p3b_start_epoch - 1)
         return self.p3a_epochs - 1
-
+    def get_phase_epoch(self):
+        return self.p1_epochs, self.p2_epochs, self.p3_dice_epochs, self.p3a_epochs, self.p3b_epochs
+    '''
     def update_phase3_gate(
         self,
         *,
@@ -260,7 +267,7 @@ class PhaseScheduler:
                     )
                 except Exception:
                     pass
-
+    '''
     def infl_scale(self, *, pred_fg_ratio: float, gt_fg_ratio: float) -> float:
         """Auto-boost scale for inflation penalty weight when Pred_fg/GT_fg is extreme."""
         denom = max(float(gt_fg_ratio), float(self.infl_min_gt))
@@ -280,20 +287,23 @@ class BgBiasController:
     用途：止血，不是主訓練方向盤。
     """
     def __init__(self,
-                 init_bias=0.0,
-                 max_bias=20.0,
-                 q10_target=-0.2,
-                 gain=0.25,
-                 step_clip=0.30,
-                 ema_w=1.0):
+             init_bias=0.0,
+             max_bias=20.0,
+             margin_q50_target=-0.05,
+             gain=0.25,
+             step_clip=0.30,
+             ema_w=0.10):
+
         self.bias = None
         self.init_bias = init_bias
         self.max_bias = max_bias
-        self.q10_target = q10_target
+
+        self.margin_q50_target = margin_q50_target
         self.gain = gain
         self.step_clip = step_clip
         self.ema_w = ema_w
-        self.q10_ema = None
+
+        self.margin_q50_ema = None
 
     def _ensure(self, device):
         if self.bias is None:
@@ -305,50 +315,96 @@ class BgBiasController:
         return torch.cat([bg0, semantic_logits_raw[:, 1:]], dim=1)
 
     @torch.no_grad()
-    def step_from_logits(self, semantic_logits_biased, pred_fg_ratio=None, phase=None):
+    def step_from_logits(self,
+                     semantic_logits_biased,
+                     pred_fg_ratio=None,
+                     phase=None):
+
+    # -----------------------------
+    # Phase-specific hyperparams
+    # -----------------------------
         if phase == 2:
             gain = 0.05
             step_clip = 0.03
             ema_w = 0.03
             deadband = 0.08
-            q10_target = -0.15
-        else:
+            margin_q50_target = -0.10
+        else:  # Phase3a / others
             gain = self.gain
             step_clip = self.step_clip
             ema_w = self.ema_w
-            deadband = 0.03
-            q10_target = self.q10_target
+            deadband = 0.05
+            margin_q50_target = -0.05
+
+        # -----------------------------
+        # Compute margin distribution
         # margin = fg_max - bg
-        bg = semantic_logits_biased[:, 0]
-        fg = semantic_logits_biased[:, 1:].amax(dim=1)
-        d = (fg - bg).flatten()
+        # -----------------------------
+        bg_logit = semantic_logits_biased[:, 0]
+        fg_logit_max = semantic_logits_biased[:, 1:].amax(dim=1)
+        margin_all = (fg_logit_max - bg_logit).flatten()
 
-        q10_now = torch.quantile(d, 0.10)
-        if self.q10_ema is None:
-            self.q10_ema = q10_now
+        margin_q50_now = torch.quantile(margin_all, 0.50)
+
+        # -----------------------------
+        # EMA on median margin
+        # -----------------------------
+        if self.margin_q50_ema is None:
+            self.margin_q50_ema = margin_q50_now
         else:
-            w = ema_w   # Phase2 = 0.03
-            self.q10_ema = (1 - w) * self.q10_ema + w * q10_now
+            w = ema_w
+            self.margin_q50_ema = (
+                (1 - w) * self.margin_q50_ema + w * margin_q50_now
+            )
 
-        # ---- (A) 全背景保護：如果已經幾乎全背景，就快速釋放 bias ----
+        # ==========================================================
+        # (A) 全背景保護：幾乎全 BG → 快速釋放 bias
+        # ==========================================================
         if pred_fg_ratio is not None and pred_fg_ratio < 0.02:
-            release = 0.05 if phase == 2 else 0.20
-            self.bias = (self.bias - 0.20).clamp(0.0, self.max_bias)   # release fast
-            return -release, float(self.q10_ema.item()), float(q10_now.item())
+            release = 0.03 if phase == 2 else 0.20
+            self.bias = (self.bias - release).clamp(0.0, self.max_bias)
+            return (
+                -release,
+                float(self.margin_q50_ema.item()),
+                float(margin_q50_now.item())
+            )
 
-        # ---- (B) deadband：在目標附近不動，降低震盪 ----
-        
-        
-        err = float(self.q10_ema.item() - q10_target)
-        if abs(err) < deadband:
-            self.bias = (self.bias * 0.999).clamp(0.0, self.max_bias)  # tiny decay
-            return 0.0, float(self.q10_ema.item()), float(q10_now.item())
+        # ==========================================================
+        # (B) 翻正保險：只要 q50 > 0，立刻加壓
+        # ==========================================================
+        if float(margin_q50_now.item()) > 0.0:
+            step = min(step_clip, 0.15)
+            self.bias = (self.bias + step).clamp(0.0, self.max_bias)
+            return (
+                step,
+                float(self.margin_q50_ema.item()),
+                float(margin_q50_now.item())
+            )
 
-        # ---- (C) 非對稱步幅：釋放要比增加快（避免鎖死）----
-        step = err * gain
-        step = float(np.clip(step, -step_clip * 2.0, + step_clip))  # release 2x faster
+        # ==========================================================
+        # (C) Deadband：接近目標不動
+        # ==========================================================
+        margin_err = float(self.margin_q50_ema.item() - margin_q50_target)
+        if abs(margin_err) < deadband:
+            self.bias = (self.bias * 0.999).clamp(0.0, self.max_bias)
+            return (
+                0.0,
+                float(self.margin_q50_ema.item()),
+                float(margin_q50_now.item())
+            )
+
+        # ==========================================================
+        # (D) Proportional control (asymmetric)
+        # ==========================================================
+        step = margin_err * gain
+        step = float(np.clip(step, -step_clip * 2.0, +step_clip))
         self.bias = (self.bias + step).clamp(0.0, self.max_bias)
-        return step, float(self.q10_ema.item()), float(q10_now.item())
+
+        return (
+            step,
+            float(self.margin_q50_ema.item()),
+            float(margin_q50_now.item())
+        )
 
 # -------------------------
 # Core: build semantic logits from (class_logits, mask_probs)
@@ -427,16 +483,94 @@ def stage1_fg_bg_loss(semantic_logits2, label_ce,
             fb_logit, gt_is_fg, pos_weight=pos_weight
         )
         stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
+    HI = 0.25  # 你可以先用 0.20~0.30 試
+    if stage1_fg_ratio > HI:
+        # 1) 直接重置 EMA（最乾淨）
+        tau_ema = tau_batch
+        fb_logit = (diff - tau_ema).clamp(-12, 12)
+        loss_fg_bg = F.binary_cross_entropy_with_logits(fb_logit, gt_is_fg, pos_weight=pos_weight)
+        stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
     return loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema
+
+@torch.no_grad()
+def build_energy_balanced_weights_from_usage(
+    class_usage_ema: torch.Tensor,   # shape (num_classes,) includes bg at 0
+    gt_counts_8: torch.Tensor,       # shape (8,) counts over y in 0..7 (fg classes)
+    alpha: float = 0.7,
+    w_min: float = 0.5,
+    w_max: float = 4.0,
+    eps: float = 1e-6,
+    e_ref_floor: float = 0.1,       # 防止 e_ref 太小造成爆衝
+) -> torch.Tensor:
+    """
+    方案A：用 prediction 的 class_usage_ema 做「反能量」權重
+    - 只對 batch 內 GT 出現的類別做加權（gt_counts_8>0），其他類別=1
+    - 權重越大 => 該類在 CE 裡越“貴” => 小器官更容易拿到梯度
+
+    回傳 shape (8,) 的 w_energy
+    """
+    device = class_usage_ema.device
+    w_energy = torch.ones(8, device=device)
+
+    present = (gt_counts_8 > 0)
+    if not present.any():
+        return w_energy
+
+    # 取出這個 batch 真的有 GT 的類別的「能量」
+    # class_usage_ema index: 0=bg, 1..8=organs
+    e = class_usage_ema[1:9].clamp_min(eps)           # (8,)
+    e_present = e[present]
+
+    # 參考能量：用 present 類別的 median，比固定值更穩
+    e_ref = torch.median(e_present).clamp_min(e_ref_floor)
+
+    # 反能量權重：能量越低 => weight 越大
+    w_present = (e_ref / e_present).pow(alpha)
+
+    # clamp + normalize（只在 present 子集合內 normalize，保持尺度穩）
+    w_present = torch.clamp(w_present, w_min, w_max)
+    w_present = w_present / w_present.mean().clamp_min(eps)
+
+    w_energy[present] = w_present
+    return w_energy
+
+def stage2_energy_paremeter(epoch_num = 20, ph = 31, p2_epochs = 20):
+    if ph == 31:
+        if epoch_num - p2_epochs == 0:
+            energy_alpha = 0.0
+            energy_wmax  = 1.0
+            enable_energy_reweight = False
+        elif epoch_num - p2_epochs == 1:
+            energy_alpha = 0.35
+            energy_wmax  = 2.0
+            enable_energy_reweight = True
+        else:
+            energy_alpha = 0.7
+            energy_wmax  = 4.0
+            enable_energy_reweight = True
+    else:
+        enable_energy_reweight = False
+    return energy_alpha, energy_wmax, enable_energy_reweight
 
 # -------------------------
 # Stage2 fg class CE on GT fg (recommended early)
 # -------------------------
-def stage2_fg_cls_loss(semantic_logits2, label_ce, cls_count_ema=None, cls_mom=0.99, iter_num=None):
+def stage2_fg_cls_loss(
+    semantic_logits2,
+    label_ce,
+    cls_count_ema=None,
+    cls_mom=0.99,
+    iter_num=None,
+    class_usage_ema=None,          # <-- 新增：prediction energy EMA
+    enable_energy_reweight=True,   # <-- 新增：開關
+    energy_alpha=0.7,
+    energy_wmin=0.5,
+    energy_wmax=4.0,
+):
     """
-    只在 GT fg pixels 做 8-class CE (label-1) + EMA inverse-freq reweight
-    semantic_logits2: (B,9,H,W)
-    label_ce: (B,H,W) in 0..8
+    只在 GT fg pixels 做 8-class CE (label-1)
+    + (原本) GT-count EMA inverse-freq reweight
+    + (方案A) prediction energy (class_usage_ema) 的反能量 reweight（只對 GT present 類）
     """
     device = semantic_logits2.device
     gt_fg = (label_ce > 0)
@@ -451,15 +585,34 @@ def stage2_fg_cls_loss(semantic_logits2, label_ce, cls_count_ema=None, cls_mom=0
     if cls_count_ema is None:
         cls_count_ema = torch.ones(8, device=device)
 
+    # ---------------------------
+    # (1) 原本：GT-count EMA inverse-freq
+    # ---------------------------
     with torch.no_grad():
-        cls_m = 0.95 if iter_num < 2000 else 0.99
-        cls_mom = cls_m
-        cls_count_ema = cls_count_ema * cls_mom + counts * (1 - cls_mom)
-        w = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(1.0, 10.0)
-        w = w / w.mean().clamp_min(1e-6)
+        cls_m = 0.95 if (iter_num is not None and iter_num < 2000) else 0.99
+        cls_count_ema = cls_count_ema * cls_m + counts * (1 - cls_m)
+        w_invfreq = (cls_count_ema.sum() / (cls_count_ema + 1.0)).clamp(1.0, 10.0)
+        w_invfreq = w_invfreq / w_invfreq.mean().clamp_min(1e-6)
 
-    loss = F.cross_entropy(logits_fg, y, weight=w, label_smoothing=0.05)
+    w_final = w_invfreq
+
+    # ---------------------------
+    # (2) 方案A：prediction energy reweight（只對 GT present 類）
+    # ---------------------------
+    if enable_energy_reweight and (class_usage_ema is not None):
+        w_energy = build_energy_balanced_weights_from_usage(
+            class_usage_ema=class_usage_ema,
+            gt_counts_8=counts,
+            alpha=float(energy_alpha),
+            w_min=float(energy_wmin),
+            w_max=float(energy_wmax),
+        )
+        w_final = w_final * w_energy
+        w_final = w_final / w_final.mean().clamp_min(1e-6)  # 保持整體尺度
+
+    loss = F.cross_entropy(logits_fg, y, weight=w_final, label_smoothing=0.05)
     return loss, cls_count_ema
+
 
 # -------------------------
 # Regularizers (only enabled in later phases)
@@ -546,14 +699,17 @@ def reg_q_div(class_logits, margin=0.9):
 
 
 
-def reg_fg_inflation(pred_fg_ratio: float, gt_fg_ratio: float, device, ratio_thr: float = 3.0, min_gt: float = 0.005):
+def reg_fg_inflation(pred_fg_ratio: float, gt_fg_ratio: float, device, ratio_thr: float = 3.0, min_gt: float = 0.005, semantic_logits2 = None):
     """
     (方案A) 前景膨脹抑制：當 pred_fg_ratio 明顯大於 GT 時，施加懲罰。
     penalty = ReLU(pred_fg_ratio - ratio_thr * max(gt_fg_ratio, min_gt))^2
     """
+    prob = torch.softmax(semantic_logits2, dim=1)
+    pred_fg_soft = (1.0 - prob[:, 0]).mean()   # differentiable
     target = ratio_thr * max(gt_fg_ratio, min_gt)
-    excess = max(0.0, pred_fg_ratio - target)
-    return torch.tensor(excess * excess, device=device)
+    #excess = max(0.0, pred_fg_ratio - target)
+    loss_infl = torch.relu(pred_fg_soft - target).pow(2)
+    return loss_infl
 # -------------------------
 # Wandb image logger (every N iters)
 # -------------------------
@@ -649,13 +805,14 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     )
 
     # Phase3a -> Phase3b indicator-based gating (p3a_epochs as upper bound)
-    phase_sched.update_phase3_gate(
-        epoch_num=epoch_num,
-        pred_fg_ratio=pred_fg_ratio,
-        gt_fg_ratio=gt_fg_ratio,
-        dom_ratio=dom_ratio,
-        num_fg_classes=num_fg_classes,
-    )
+
+    # phase_sched.update_phase3_gate(
+    #     epoch_num=epoch_num,
+    #     pred_fg_ratio=pred_fg_ratio,
+    #     gt_fg_ratio=gt_fg_ratio,
+    #     dom_ratio=dom_ratio,
+    #     num_fg_classes=num_fg_classes,
+    # )
 
 
 
@@ -664,9 +821,9 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # Phase weights
     # -------------------------
     ph, w = phase_sched.weights(epoch_num)
-
+    
     # controller step (extreme-only + cooldown)
-    delta, q10_ema, q10_now = controller.step_from_logits(semantic_logits2, pred_fg_ratio=pred_fg_ratio, phase=ph)
+    delta, q50_ema, q50_now = controller.step_from_logits(semantic_logits2, pred_fg_ratio=pred_fg_ratio, phase=ph)
 
     # NOTE: 你要讓「當次 loss」用更新後 bias 嗎？
     # 這裡採「下一 iter 生效」更穩（避免同 iter 震盪）
@@ -688,17 +845,35 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     # Stage2 loss (fg class on GT fg)
     # -------------------------
+    _, p2_epochs, p3_dice_epochs, _, _ = phase_sched.get_phase_epoch()
+    energy_alpha, energy_wmax, enable_energy_reweight = stage2_energy_paremeter(epoch_num=epoch_num, ph=ph, p2_epochs=p2_epochs)
+    if epoch_num in(p2_epochs, p2_epochs+1, p2_epochs+2) and iter_num%300 == 0:
+        logging.info(
+            f"[P3A-warmup] Epochs={epoch_num} "
+            f"enable={enable_energy_reweight} "
+            f"alpha={energy_alpha:.2f} wmax={energy_wmax:.2f}"
+        )
     loss_fg_cls, cls_count_ema = stage2_fg_cls_loss(
-        semantic_logits2, label_ce,
-        cls_count_ema=cls_count_ema, 
-        cls_mom=0.99, 
-        iter_num=iter_num
+        semantic_logits2,
+        label_ce,
+        cls_count_ema=cls_count_ema,
+        cls_mom=0.99,
+        iter_num=iter_num,
+        class_usage_ema=class_usage_ema,
+        enable_energy_reweight=enable_energy_reweight,
+        energy_alpha=energy_alpha,
+        energy_wmin=0.5,
+        energy_wmax=energy_wmax,
     )
 
     # -------------------------
     # Dice (small)
     # -------------------------
-    loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
+    if epoch_num < p3_dice_epochs:
+        loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
+    else:
+        loss_dice = dice_per_class_gt_present(semantic_logits2, label_ce)
+        w["dice"] = 0.25
 
     # -------------------------
     # Regularizers (phase-gated)
@@ -710,7 +885,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         stage1_fg_ratio=stage1_fg_ratio,
         num_fg_classes=num_fg_classes,
         dom_ratio=dom_ratio,
-        q10_ema=float(q10_ema) if q10_ema is not None else 0.0
+        q10_ema=float(q50_ema) if q50_ema is not None else 0.0
     )
 
     # (方案A) 3-state gating (only for ph==32)
@@ -719,8 +894,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         w["cls_div"] = 0.0
         w["pix_div"] = 0.0
         w["q_div"]   = 0.0
-    if div_mode != 2:
-        w["infl"]    = 0.0
+    
 
     # (方案A+) Auto-boost inflation penalty only when it is enabled (div_mode==2)
     if div_mode == 2 and w.get("infl", 0.0) > 0:
@@ -731,7 +905,8 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     loss_cls_div = reg_cls_div(class_logits, cls_count_ema) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_pix_div = torch.tensor(0.0, device=semantic_logits2.device)  # (方案A) pix_div removed
     loss_q_div = reg_q_div(class_logits, margin=0.9) if w["q_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
-    loss_infl = reg_fg_inflation(pred_fg_ratio, gt_fg_ratio, semantic_logits2.device) if w["infl"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_infl = reg_fg_inflation(pred_fg_ratio, gt_fg_ratio, semantic_logits2.device, semantic_logits2=semantic_logits2) if w["infl"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
+    loss_mbg = loss_bg_margin_on_gt_bg(semantic_logits2, label_ce,  margin=0.5, power=2.0, use_softplus=False)
 
     # pseudo（Phase4 才開；這裡留鉤子，你可直接接你原本 pseudo 寫法）
     loss_pseudo = torch.tensor(0.0, device=semantic_logits2.device)
@@ -749,8 +924,24 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         w["pix_div"] * loss_pix_div +
         w["q_div"] * loss_q_div +
         w["infl"] * loss_infl +
-        w["pseudo"] * loss_pseudo
+        w["pseudo"] * loss_pseudo +
+        w["bgm"] * loss_mbg
     )
+    loss_dict = {
+        "fb":       loss_fg_bg,
+        "cls":      loss_fg_cls,
+        "dice":     loss_dice,
+        "area":     loss_area,
+        "ovlp":     loss_ovlp,
+        "cls_div":  loss_cls_div,
+        "pix_div":  loss_pix_div,
+        "q_div":    loss_q_div,
+        "infl":     loss_infl,
+        "pseudo":   loss_pseudo,
+        "bgm":      loss_mbg,
+    }
+
+    
 
     # -------------------------
     # backward / step
@@ -802,8 +993,8 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
             f"[PHASE] phase={ph} "
             f"controller_delta={delta:+.3f} "
             f"bias={float(controller.bias.item()):.3f} "
-            f"q10_now={q10_now:+.3f} "
-            f"q10_ema={q10_ema:+.3f}"
+            f"q50_now={q50_now:+.3f} "
+            f"q50_ema={q50_ema:+.3f}"
         )
 
         logging.info(
@@ -844,6 +1035,8 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"[DIV] cls_div={loss_cls_div.item():.6f} "
                 f"pix_div={loss_pix_div.item():.6f} "
                 f"q_div={loss_q_div.item():.6f} "
+                f"infl={loss_infl.item():.6f} "
+                f"mbg={loss_mbg.item():.6f} "
                 f"div_mode={int(div_mode)}"
             )
 
@@ -854,11 +1047,24 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"q_div={loss_q_div.item():.6f} "
                 f"pseudo={loss_pseudo.item():.6f}"
             )
+        log_loss_contributions(w, loss_dict, loss)
 
         logging.info("======= CHECK FG CLASS ENERGY =======")
         logging.info(f"[FG_CLASS_STATE] num_fg_classes={num_fg_classes}")
         for c in range(1, args.num_classes):
             logging.info(f"[FG_CLASS] class={c} ema_ratio={class_usage_snapshot[c]:.4f}")
+
+        with torch.no_grad():
+        # present 類（這個 batch GT 有出現的 organ）
+            gt_fg = (label_ce > 0)
+            if gt_fg.any():
+                y = (label_ce[gt_fg] - 1).long()
+                device = "cuda"
+                counts = torch.bincount(y, minlength=8).float().to(device)
+                present = (counts > 0).nonzero().flatten().tolist()
+                e = class_usage_ema[1:9].detach().cpu().tolist()
+                logging.info(f"[A-WEIGHT] GT_present_cls={present} usage_e={[round(e[i],4) for i in present]}")
+
         
         
     # tensorboard
@@ -1024,14 +1230,8 @@ def gate_diversity(
 
     # ---------- Mode 2: FG inflation (highest priority) ----------
     ratio = pred_fg_ratio / (gt_fg_ratio + 1e-6) if gt_fg_ratio > 0 else (1e9 if pred_fg_ratio > 0 else 0.0)
-    if (pred_fg_ratio >= inflation_pred_abs and ratio >= inflation_ratio_thr) or (pred_fg_ratio >= 0.60 and gt_fg_ratio <= 0.15):
+    if ratio >= 3.0:
         return 2
-
-
-    # Phase3a (31): we only use inflation veto / penalty; do NOT enable collapse-div here.
-    if ph == 31:
-        return 0
-
 
     # ---------- Mode 1: semantic collapse ----------
     # Only consider collapse when there is enough GT FG signal; otherwise skip.
@@ -1150,6 +1350,149 @@ def validate_synapse(
     logging.info("Epoch %d : Validation Mean Dice: %f", epoch_num, avg_val_dice)
 
     return avg_val_dice, class_mean
+
+def loss_bg_margin_on_gt_bg(
+    semantic_logits: torch.Tensor,
+    label_ce: torch.Tensor,
+    margin: float = 0.5,
+    power: float = 2.0,
+    use_softplus: bool = False,
+    reduction: str = "mean",
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Penalize cases where any FG logit exceeds BG logit on GT=background pixels.
+
+    Args:
+        semantic_logits: (B, C, H, W) raw logits. C includes background at index 0.
+        label_ce:        (B, H, W) integer labels, 0 = background.
+        margin:          desired safety margin: enforce (fg_max - bg) <= -margin on GT-bg pixels.
+                         i.e., penalize relu((fg_max - bg) + margin).
+        power:           penalty power (2.0 => squared hinge).
+        use_softplus:    if True, use softplus instead of ReLU for smoother gradients.
+        reduction:       "mean" or "sum" (only applied over GT-bg pixels).
+        eps:             numerical safety for empty-mask handling.
+
+    Returns:
+        A scalar tensor loss.
+    """
+    assert semantic_logits.dim() == 4, "semantic_logits must be (B,C,H,W)"
+    assert label_ce.dim() == 3, "label_ce must be (B,H,W)"
+    assert semantic_logits.size(0) == label_ce.size(0)
+    assert semantic_logits.size(2) == label_ce.size(1)
+    assert semantic_logits.size(3) == label_ce.size(2)
+    assert semantic_logits.size(1) >= 2, "Need at least 2 classes (bg + fg)."
+
+    # BG logit: (B,H,W)
+    bg = semantic_logits[:, 0]
+
+    # Max FG logit over classes 1..C-1: (B,H,W)
+    fg_max = semantic_logits[:, 1:].amax(dim=1)
+
+    # m > 0 means some FG is beating BG at that pixel
+    m = fg_max - bg  # (B,H,W)
+
+    # GT background mask
+    gt_bg = (label_ce == 0)
+
+    if gt_bg.any():
+        # Penalize when FG wins BG (or is too close) on GT-bg pixels:
+        # want m <= -margin  -> penalize (m + margin) > 0
+        x = m[gt_bg] + float(margin)
+
+        if use_softplus:
+            # smooth hinge: softplus(x)
+            pen = F.softplus(x)
+        else:
+            # hinge: relu(x)
+            pen = F.relu(x)
+
+        if power != 1.0:
+            pen = pen.pow(float(power))
+
+        if reduction == "mean":
+            return pen.mean()
+        elif reduction == "sum":
+            return pen.sum()
+        else:
+            raise ValueError(f"Unsupported reduction={reduction}")
+    else:
+        # No GT-bg pixels in this batch (rare but possible); return 0 with correct device/dtype
+        return semantic_logits.sum() * 0.0
+    
+def log_loss_contributions(
+    w: dict,
+    losses: dict,
+    total_loss: torch.Tensor,
+    prefix: str = "[LOSS_BREAKDOWN]",
+    eps: float = 1e-12,
+):
+    """
+    Print weighted loss contributions and percentage of total loss.
+
+    Args:
+        w:        dict of weights, e.g. w["cls"], w["dice"], ...
+        losses:   dict of raw losses, keys must match w keys (subset ok)
+        total_loss: scalar tensor (already summed with weights)
+        prefix:   log prefix
+        eps:      numerical stability
+    """
+    total_val = float(total_loss.detach().item())
+    denom = abs(total_val) + eps
+
+    logging.info(prefix)
+    for k, raw in losses.items():
+        weight = float(w.get(k, 0.0))
+        raw_val = float(raw.detach().item()) if raw is not None else 0.0
+        contrib = weight * raw_val
+        ratio = 100.0 * contrib / denom
+        logging.info(
+            f"  {k:>8s}: "
+            f"raw={raw_val:9.6f} | "
+            f"w={weight:9.2e} | "
+            f"w*raw={contrib:9.6f} | "
+            f"{ratio:6.2f}%"
+        )
+
+    logging.info(f"  {'TOTAL':>8s}: {total_val:8.6f} (100.00%)")
+
+def dice_per_class_gt_present(
+    semantic_logits2,          
+    target,         # (B, H, W) 0=bg, 1..C-1=fg classes
+    eps=1e-6
+):
+    """
+    Per-class Dice loss, only for GT-present foreground classes.
+    Returns a scalar loss.
+    """
+    probs = torch.softmax(semantic_logits2, dim=1)
+    B, C, H, W = probs.shape
+    device = probs.device
+
+    losses = []
+
+    # foreground classes only: 1 .. C-1
+    for cls in range(1, C):
+        gt_mask = (target == cls)          # (B,H,W) bool
+        if not gt_mask.any():
+            continue  #  GT 沒出現，直接跳過
+
+        pred = probs[:, cls]               # (B,H,W)
+        gt   = gt_mask.float()
+
+        # soft dice
+        inter = (pred * gt).sum()
+        denom = pred.sum() + gt.sum()
+
+        dice = (2.0 * inter + eps) / (denom + eps)
+        losses.append(1.0 - dice)
+
+    # 如果這個 batch 剛好沒有任何前景（極少數）
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(losses).mean()
+
 '''
 
 
@@ -1616,14 +1959,15 @@ def trainer_synapse(args, model, snapshot_path):
 
     p1_epochs=2
     p2_epochs=20
-    p3a_epochs=30
+    p3_dice_epochs=31
+    p3a_epochs=100
     p3b_epochs=200
 
-    phase_sched = PhaseScheduler(p1_epochs=p1_epochs, p2_epochs=p2_epochs, p3a_epochs=p3a_epochs, p3b_epochs=p3b_epochs)
+    phase_sched = PhaseScheduler(p1_epochs=p1_epochs, p2_epochs=p2_epochs, p3_dice_epochs=p3_dice_epochs, p3a_epochs=p3a_epochs, p3b_epochs=p3b_epochs)
     controller = BgBiasController(
         init_bias=0.0,
         max_bias=20.0,      # 先放大，因為你 margin 會到 +3，max_bias=2 根本不夠
-        q10_target=-0.1,    # 目標：讓 q10(fg-bg) 壓回負值
+        margin_q50_target=-0.1,    # 目標：讓 q10(fg-bg) 壓回負值
         gain=0.12,          # 回授增益
         step_clip=0.12,     # 單步最大調整（止血用，之後可再縮）
         ema_w=1.0
@@ -1692,7 +2036,10 @@ def trainer_synapse(args, model, snapshot_path):
 
     for epoch_num in iterator:
         model.train()
-
+        if epoch_num == p3_dice_epochs:
+            print("============================")
+            print("Change Dice Loss Function")
+            print("============================")
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch["image"].cuda(), sampled_batch["label"].cuda()
             label_ce = _to_label_ce(label_batch)
@@ -1748,6 +2095,22 @@ def trainer_synapse(args, model, snapshot_path):
                 "bg_bias": controller.bias,
             }
             save_mode_path = os.path.join(snapshot_path, 'phase2_epoch_' + str(epoch_num) + '.pth')
+            torch.save(ckpt, save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+
+        if epoch_num == p3_dice_epochs - 1:
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),   # 可選
+                "iter": iter_num,
+                "epoch": epoch_num,
+
+                # ===== training state =====
+                "class_usage_ema": class_usage_ema,
+                "tau_ema": tau_ema_state,
+                "bg_bias": controller.bias,
+            }
+            save_mode_path = os.path.join(snapshot_path, 'phase3_dice_epoch_' + str(epoch_num) + '.pth')
             torch.save(ckpt, save_mode_path)
             logging.info("save model to {}".format(save_mode_path))
         
