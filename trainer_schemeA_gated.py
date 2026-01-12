@@ -1075,11 +1075,11 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"infl={loss_infl.item():.6f} "
                 f"mbg={loss_mbg.item():.6f} "
                 f"div_mode={int(div_mode)}"
-                f"train/underseg_flag"={int(underseg_flag):.6f}"
-                f"train/underseg_ratio"={float(underseg_ratio):.6f}"
-                f"train/pred_fg_soft"={float(pred_fg_soft):.6f}"
-                f"train/mean_margin"={float(mean_margin):.6f}"
-                f"train/loss_recall_floor"={float(loss_recall_floor.item()):.6f}"
+                f"train/underseg_flag={int(underseg_flag):.6f}"
+                f"train/underseg_ratio={float(underseg_ratio):.6f}"
+                f"train/pred_fg_soft={float(pred_fg_soft):.6f}"
+                f"train/mean_margin={float(mean_margin):.6f}"
+                f"train/loss_recall_floor={float(loss_recall_floor.item()):.6f}"
             )
 
         if ph == 4:
