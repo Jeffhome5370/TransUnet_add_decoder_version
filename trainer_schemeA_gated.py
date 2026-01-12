@@ -154,7 +154,8 @@ class PhaseScheduler:
             "q_div": 0.0,
             "infl": 0.0,
             "pseudo": 0.0,
-            "bgm":0.0
+            "bgm":0.0,
+            "recall":0.0
         }
 
         if ph == 1:
@@ -437,60 +438,68 @@ def build_semantic_logits(class_logits, mask_probs, den_clamp=0.2, T_cls=4.0, ep
 # -------------------------
 # Stage1 fg/bg loss (keep as you already do)
 # -------------------------
-def stage1_fg_bg_loss(semantic_logits2, label_ce,
-                      target_ratio_mult=1.5,
-                      tau_ema_state=None,
-                      tau_mom=0.98,
-                      posw_cap=80.0):
-    """
-    用 semantic logits 的 fg-vs-bg margin 做二元判斷（不改你架構）
-    回傳：loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema_state
-    """
-    bg_logit = semantic_logits2[:, 0:1]             # (B,1,H,W)
-    fg_logit = semantic_logits2[:, 1:].amax(1, True)  # (B,1,H,W)
-    diff = fg_logit - bg_logit                      # (B,1,H,W)
+def stage1_fg_bg_loss(
+    semantic_logits2, label_ce,
+    target_ratio_mult=1.5,
+    tau_ema_state=None,
+    tau_mom=0.98,
+    posw_cap=80.0,
+    target_min=0.0,
+    target_max=0.20,
+    freeze_tau_if_gt0=True,
+):
+    bg_logit = semantic_logits2[:, 0:1]
+    fg_logit = semantic_logits2[:, 1:].amax(1, True)
+    diff = fg_logit - bg_logit
 
     with torch.no_grad():
         gt_is_fg = (label_ce > 0).float().unsqueeze(1)
-        gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)
-        target_ratio = (gt_fg_ratio * target_ratio_mult).clamp(0.005, 0.20)
+        gt_cnt = int(gt_is_fg.sum().item())
 
-        flat = diff.detach().flatten()
-        N = flat.numel()
-        k = int((1.0 - float(target_ratio.item())) * N)
-        k = max(0, min(N - 1, k))
-        tau_batch = flat.kthvalue(k + 1).values
+        # --- GT = 0: 不要強迫畫 FG，也不要更新 tau（避免 drift）
+        if gt_cnt == 0:
+            target_ratio = torch.tensor(0.0, device=diff.device)
+            pos_weight = torch.tensor(1.0, device=diff.device)
 
-        if tau_ema_state is None:
-            tau_ema = tau_batch
+            if tau_ema_state is None:
+                # 讓 fb_logit 幾乎全為負 => stage1_fg_ratio ~ 0
+                tau_ema = diff.detach().max()
+            else:
+                tau_ema = tau_ema_state if freeze_tau_if_gt0 else diff.detach().max()
+
         else:
-            tau_ema = tau_mom * tau_ema_state + (1 - tau_mom) * tau_batch
+            gt_fg_ratio = gt_is_fg.mean().clamp(1e-4, 0.5)
+            target_ratio = (gt_fg_ratio * target_ratio_mult).clamp(target_min, target_max)
 
-        fg_frac = gt_is_fg.mean().clamp_min(1e-4)
-        pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=posw_cap)
+            flat = diff.detach().flatten()
+            N = flat.numel()
+            k = int((1.0 - float(target_ratio.item())) * N)
+            k = max(0, min(N - 1, k))
+            tau_batch = flat.kthvalue(k + 1).values
 
-    fb_logit = (diff - tau_ema).clamp(-12, 12)  # (B,1,H,W)
-    loss_fg_bg = F.binary_cross_entropy_with_logits(
-        fb_logit, gt_is_fg, pos_weight=pos_weight
-    )
+            if tau_ema_state is None:
+                tau_ema = tau_batch
+            else:
+                tau_ema = tau_mom * tau_ema_state + (1 - tau_mom) * tau_batch
+
+            fg_frac = gt_is_fg.mean().clamp_min(1e-4)
+            pos_weight = ((1.0 - fg_frac) / fg_frac).clamp(max=posw_cap)
+
+    fb_logit = (diff - tau_ema).clamp(-12, 12)
+    loss_fg_bg = F.binary_cross_entropy_with_logits(fb_logit, gt_is_fg, pos_weight=pos_weight)
 
     with torch.no_grad():
         stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
-    if stage1_fg_ratio < 0.01:
+
+    # 保留你原本的 safety：真的快全背景時放鬆 tau
+    if stage1_fg_ratio < 0.01 and gt_cnt > 0:
         tau_ema = tau_ema - 0.5
-        fb_logit = (diff - tau_ema).clamp(-12, 12)
-        loss_fg_bg = F.binary_cross_entropy_with_logits(
-            fb_logit, gt_is_fg, pos_weight=pos_weight
-        )
-        stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
-    HI = 0.25  # 你可以先用 0.20~0.30 試
-    if stage1_fg_ratio > HI:
-        # 1) 直接重置 EMA（最乾淨）
-        tau_ema = tau_batch
         fb_logit = (diff - tau_ema).clamp(-12, 12)
         loss_fg_bg = F.binary_cross_entropy_with_logits(fb_logit, gt_is_fg, pos_weight=pos_weight)
         stage1_fg_ratio = float((fb_logit > 0).float().mean().item())
+
     return loss_fg_bg, fb_logit, stage1_fg_ratio, tau_ema
+
 
 @torch.no_grad()
 def build_energy_balanced_weights_from_usage(
@@ -782,6 +791,10 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     semantic_logits2 = controller.apply(semantic_logits_raw)
 
+    pred_fg_soft, mean_margin = compute_pred_fg_soft_and_mean_margin(semantic_logits2)
+    underseg_flag, underseg_ratio = is_underseg(gt_fg_ratio, pred_fg_ratio, mean_margin)
+
+
     # compute pred stats (after bias)
     pred, pred_fg_ratio, gt_fg_ratio, pred_unique = compute_pred_stats(semantic_logits2, label_ce)
     dom_cls, dom_ratio = fg_hist_dom(pred, args.num_classes)
@@ -869,11 +882,11 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     # Dice (small)
     # -------------------------
-    if epoch_num < p3_dice_epochs:
-        loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
-    else:
-        loss_dice = dice_per_class_gt_present(semantic_logits2, label_ce)
-        w["dice"] = 0.25
+        if epoch_num < p3_dice_epochs:
+            loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
+        else:
+            loss_dice = dice_per_class_gt_present(semantic_logits2, label_ce, num_classes=args.num_classes, min_pixels=20, class_boost={2: 1.5})
+            w["dice"] = 0.25
 
     # -------------------------
     # Regularizers (phase-gated)
@@ -900,6 +913,27 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     if div_mode == 2 and w.get("infl", 0.0) > 0:
         w["infl"] = float(w["infl"]) * float(phase_sched.infl_scale(pred_fg_ratio=pred_fg_ratio, gt_fg_ratio=gt_fg_ratio))
 
+    # --- under-seg guard: 只在 under-seg 才啟動 ---
+    loss_recall_floor = torch.tensor(0.0, device=semantic_logits2.device)
+    if underseg_flag and ph in (31, 32):
+        # (1) 放鬆煞車：快速釋放一些 bg bias（避免 locked-in）
+        with torch.no_grad():
+            severity = min(1.0, max(0.0, (0.30 - underseg_ratio) / 0.30))  # ratio_us = Pred/GT
+            delta = 0.05 + 0.10 * severity  # 0.05~0.15
+            controller.bias = (controller.bias - delta).clamp(0.0, controller.max_bias)
+
+        # (2) 下限補償（soft）：pred_fg_soft 至少要到 k * GT_fg
+        k = 0.30
+        target_floor = torch.tensor(k * gt_fg_ratio, device=semantic_logits2.device)
+        pred_soft_t = torch.tensor(pred_fg_soft, device=semantic_logits2.device)
+        loss_recall_floor = F.relu(target_floor - pred_soft_t).pow(2)
+
+        # 這個權重建議很小，因為它是「只補下限」
+        w.setdefault("recall", 0.0)
+        w["recall"] = 0.05
+    else:
+        w.setdefault("recall", 0.0)
+
     loss_area = reg_area_pen(mask_probs) if w["area"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_ovlp = reg_overlap_pen(mask_probs, den_raw, thr=2.0) if w["ovlp"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
     loss_cls_div = reg_cls_div(class_logits, cls_count_ema) if w["cls_div"] > 0 else torch.tensor(0.0, device=semantic_logits2.device)
@@ -925,7 +959,8 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         w["q_div"] * loss_q_div +
         w["infl"] * loss_infl +
         w["pseudo"] * loss_pseudo +
-        w["bgm"] * loss_mbg
+        w["bgm"] * loss_mbg +
+        w["recall"] * loss_recall_floor
     )
     loss_dict = {
         "fb":       loss_fg_bg,
@@ -939,6 +974,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
         "infl":     loss_infl,
         "pseudo":   loss_pseudo,
         "bgm":      loss_mbg,
+        "recall":   loss_recall_floor,
     }
 
     
@@ -1038,6 +1074,11 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
                 f"infl={loss_infl.item():.6f} "
                 f"mbg={loss_mbg.item():.6f} "
                 f"div_mode={int(div_mode)}"
+                f"train/underseg_flag"={int(underseg_flag):.6f},
+                f"train/underseg_ratio"={float(underseg_ratio):.6f},
+                f"train/pred_fg_soft"={float(pred_fg_soft):.6f},
+                f"train/mean_margin"={float(mean_margin):.6f},
+                f"train/loss_recall_floor"={float(loss_recall_floor.item()):.6f},
             )
 
         if ph == 4:
@@ -1119,6 +1160,9 @@ def _to_label_ce(label_batch: torch.Tensor) -> torch.Tensor:
 
 def _maybe_skip_slice(label_ce: torch.Tensor, bg_keep_prob: float, min_fg_ratio: float) -> bool:
     # return True => skip
+    if (label_ce == 2).any():
+        return False
+
     fg_cnt = (label_ce > 0).sum().item()
     if fg_cnt == 0:
         return (torch.rand(1, device=label_ce.device).item() > bg_keep_prob)
@@ -1457,41 +1501,59 @@ def log_loss_contributions(
     logging.info(f"  {'TOTAL':>8s}: {total_val:8.6f} (100.00%)")
 
 def dice_per_class_gt_present(
-    semantic_logits2,          
-    target,         # (B, H, W) 0=bg, 1..C-1=fg classes
-    eps=1e-6
+    semantic_logits2,
+    target,
+    eps=1e-6,
+    min_pixels=20,
+    class_boost=None,   # e.g. {2: 1.5}
 ):
-    """
-    Per-class Dice loss, only for GT-present foreground classes.
-    Returns a scalar loss.
-    """
     probs = torch.softmax(semantic_logits2, dim=1)
     B, C, H, W = probs.shape
     device = probs.device
 
     losses = []
 
-    # foreground classes only: 1 .. C-1
     for cls in range(1, C):
-        gt_mask = (target == cls)          # (B,H,W) bool
-        if not gt_mask.any():
-            continue  #  GT 沒出現，直接跳過
+        gt_mask = (target == cls)
+        if gt_mask.sum() < min_pixels:
+            continue
 
-        pred = probs[:, cls]               # (B,H,W)
-        gt   = gt_mask.float()
+        pred = probs[:, cls]
+        gt = gt_mask.float()
 
-        # soft dice
         inter = (pred * gt).sum()
         denom = pred.sum() + gt.sum()
 
         dice = (2.0 * inter + eps) / (denom + eps)
-        losses.append(1.0 - dice)
+        l = 1.0 - dice
 
-    # 如果這個 batch 剛好沒有任何前景（極少數）
+        if class_boost is not None and cls in class_boost:
+            l = l * float(class_boost[cls])
+
+        losses.append(l)
+
     if len(losses) == 0:
         return torch.tensor(0.0, device=device)
 
     return torch.stack(losses).mean()
+
+
+def compute_pred_fg_soft_and_mean_margin(semantic_logits2):
+    prob = torch.softmax(semantic_logits2, dim=1)
+    pred_fg_soft = float((1.0 - prob[:, 0]).mean().item())
+
+    bg = semantic_logits2[:, 0]
+    fg = semantic_logits2[:, 1:].amax(dim=1)
+    mean_margin = float((fg - bg).mean().item())
+    return pred_fg_soft, mean_margin
+
+def is_underseg(gt_fg_ratio, pred_fg_ratio, mean_margin,
+                gt_min=0.03, ratio_thr=0.30, margin_thr=-0.40):
+    if gt_fg_ratio < gt_min:
+        return False, 999.0
+    ratio = pred_fg_ratio / max(gt_fg_ratio, 1e-6)
+    flag = (ratio < ratio_thr) and (mean_margin < margin_thr)
+    return flag, ratio
 
 '''
 
