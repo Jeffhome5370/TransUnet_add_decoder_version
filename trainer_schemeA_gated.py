@@ -792,13 +792,15 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     # -------------------------
     semantic_logits2 = controller.apply(semantic_logits_raw)
 
-    pred_fg_soft, mean_margin = compute_pred_fg_soft_and_mean_margin(semantic_logits2)
-    underseg_flag, underseg_ratio = is_underseg(gt_fg_ratio, pred_fg_ratio, mean_margin)
+    
 
 
     # compute pred stats (after bias)
     pred, pred_fg_ratio, gt_fg_ratio, pred_unique = compute_pred_stats(semantic_logits2, label_ce)
     dom_cls, dom_ratio = fg_hist_dom(pred, args.num_classes)
+
+    pred_fg_soft, mean_margin = compute_pred_fg_soft_and_mean_margin(semantic_logits2)
+    underseg_flag, underseg_ratio = is_underseg(gt_fg_ratio, pred_fg_ratio, mean_margin)
 
     # semantic prediction
     #pred_cls = semantic_logits2.argmax(1) == pred           # (B,H,W)
