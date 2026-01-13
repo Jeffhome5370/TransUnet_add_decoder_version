@@ -888,7 +888,7 @@ def training_step_core(args, model, dice_loss_fn, optimizer, writer, wandb,
     if epoch_num < p3_dice_epochs:
         loss_dice = dice_softmax_loss(dice_loss_fn, semantic_logits2, label_ce)
     else:
-        loss_dice = dice_per_class_gt_present(semantic_logits2, label_ce, num_classes=args.num_classes, min_pixels=20, class_boost={2: 1.5})
+        loss_dice = dice_per_class_gt_present(semantic_logits2, label_ce, min_pixels=20, class_boost={2: 1.5})
         w["dice"] = 0.25
 
     # -------------------------
