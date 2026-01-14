@@ -2024,7 +2024,7 @@ def trainer_synapse(args, model, snapshot_path):
 
     p1_epochs=2
     p2_epochs=20
-    p3_dice_epochs=31
+    p3_dice_epochs=20
     p3a_epochs=100
     p3b_epochs=200
 
